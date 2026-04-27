@@ -15,6 +15,7 @@
 
 mod backend_support;
 mod bot;
+mod commands;
 mod config_resolution;
 mod display;
 mod doctor;
@@ -39,16 +40,15 @@ mod wave;
 mod web;
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use ralph_adapters::detect_backend;
 use ralph_core::{
-    CheckStatus, EventHistory, LockError, LoopContext, LoopEntry, LoopLock, LoopRegistry,
-    PreflightReport, PreflightRunner, RalphConfig, TerminationReason, UrgentSteerStore,
+    CheckStatus, LockError, LoopContext, LoopEntry, LoopLock, LoopRegistry,
+    PreflightReport, PreflightRunner, RalphConfig, TerminationReason,
     truncate_with_ellipsis,
     worktree::{WorktreeConfig, create_worktree, ensure_gitignore, remove_worktree},
 };
-use std::fs;
-use std::io::{IsTerminal, Write, stdout};
+use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -207,7 +207,7 @@ pub(crate) fn resolve_path_from_workspace(
     resolve_workspace_root(root).join(path)
 }
 
-fn urgent_steer_path_from_workspace(root: Option<&PathBuf>) -> PathBuf {
+pub(crate) fn urgent_steer_path_from_workspace(root: Option<&PathBuf>) -> PathBuf {
     resolve_workspace_root(root).join(".ralph/urgent-steer.json")
 }
 
@@ -223,7 +223,7 @@ pub(crate) fn discover_workspace_root(start: &Path) -> Option<PathBuf> {
     })
 }
 
-fn resolve_marker_target(workspace_root: &Path, marker_value: &str) -> PathBuf {
+pub(crate) fn resolve_marker_target(workspace_root: &Path, marker_value: &str) -> PathBuf {
     let path = PathBuf::from(marker_value.trim());
     if path.is_absolute() {
         path
@@ -525,7 +525,7 @@ pub(crate) fn load_config_with_overrides(
 /// Ralph Orchestrator - Multi-agent orchestration framework
 #[derive(Parser, Debug)]
 #[command(name = "ralph", version, about)]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -568,7 +568,7 @@ enum Commands {
     Doctor(doctor::DoctorArgs),
 
     /// Interactive walkthrough of hats, hat collections, and workflow
-    Tutorial(TutorialArgs),
+    Tutorial(commands::tutorial::TutorialArgs),
 
     /// DEPRECATED: Use `ralph run --continue` instead.
     /// Resume a previously interrupted loop from existing scratchpad.
@@ -576,26 +576,26 @@ enum Commands {
     Resume(ResumeArgs),
 
     /// View event history for debugging
-    Events(EventsArgs),
+    Events(commands::events::EventsArgs),
 
     /// Initialize a new ralph.yml configuration file
-    Init(InitArgs),
+    Init(commands::init::InitArgs),
 
     /// Clean up Ralph artifacts from `.ralph/agent`.
-    Clean(CleanArgs),
+    Clean(commands::clean::CleanArgs),
 
     /// Emit an event to the current run's events file with proper JSON formatting
-    Emit(EmitArgs),
+    Emit(commands::emit::EmitArgs),
 
     /// Start a Prompt-Driven Development planning session
-    Plan(PlanArgs),
+    Plan(commands::plan::PlanArgs),
 
     /// Generate code task files from descriptions or plans
-    CodeTask(CodeTaskArgs),
+    CodeTask(commands::plan::CodeTaskArgs),
 
     /// Legacy alias for `code-task` (runtime tasks are `ralph tools task`).
     #[command(hide = true)]
-    Task(CodeTaskArgs),
+    Task(commands::plan::CodeTaskArgs),
 
     /// Ralph's runtime tools (agent-facing)
     Tools(tools::ToolsArgs),
@@ -622,32 +622,7 @@ enum Commands {
     Bot(bot::BotArgs),
 
     /// Generate shell completions
-    Completions(CompletionsArgs),
-}
-
-/// Arguments for the init subcommand.
-#[derive(Parser, Debug)]
-struct InitArgs {
-    /// Backend to use (claude, kiro, gemini, codex, amp, copilot, opencode, pi, custom).
-    /// Generates core config only.
-    #[arg(long, conflicts_with = "list_presets")]
-    backend: Option<String>,
-
-    /// REMOVED: monolithic presets are no longer supported.
-    ///
-    /// Use split config instead:
-    ///   ralph init --backend <backend>
-    ///   ralph run -c ralph.yml -H builtin:<collection>
-    #[arg(long, conflicts_with = "list_presets", conflicts_with = "backend")]
-    preset: Option<String>,
-
-    /// List all available builtin hat collections
-    #[arg(long, conflicts_with = "backend", conflicts_with = "preset")]
-    list_presets: bool,
-
-    /// Overwrite existing ralph.yml if present
-    #[arg(long)]
-    force: bool,
+    Completions(commands::completions::CompletionsArgs),
 }
 
 /// Arguments for the run subcommand.
@@ -798,125 +773,6 @@ struct ResumeArgs {
     record_session: Option<PathBuf>,
 }
 
-/// Arguments for the events subcommand.
-#[derive(Parser, Debug)]
-struct EventsArgs {
-    /// Show only the last N events
-    #[arg(long)]
-    last: Option<usize>,
-
-    /// Filter by topic (e.g., "build.blocked")
-    #[arg(long)]
-    topic: Option<String>,
-
-    /// Filter by iteration number
-    #[arg(long)]
-    iteration: Option<u32>,
-
-    /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    format: OutputFormat,
-
-    /// Path to events file (default: auto-detects current run)
-    #[arg(long)]
-    file: Option<PathBuf>,
-
-    /// Clear the event history
-    #[arg(long)]
-    clear: bool,
-}
-
-/// Arguments for the clean subcommand.
-#[derive(Parser, Debug)]
-struct CleanArgs {
-    /// Preview what would be deleted without actually deleting
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Clean diagnostic logs instead of `.ralph/` directory
-    #[arg(long)]
-    diagnostics: bool,
-}
-
-/// Arguments for the emit subcommand.
-#[derive(Parser, Debug)]
-struct EmitArgs {
-    /// Event topic (e.g., "build.done", "review.complete")
-    pub topic: String,
-
-    /// Event payload - string or JSON (optional, defaults to empty)
-    #[arg(default_value = "")]
-    pub payload: String,
-
-    /// Parse payload as JSON object instead of string
-    #[arg(long, short)]
-    pub json: bool,
-
-    /// Custom ISO 8601 timestamp (defaults to current time)
-    #[arg(long)]
-    pub ts: Option<String>,
-
-    /// Path to events file (defaults to .ralph/events.jsonl)
-    #[arg(long, default_value = ".ralph/events.jsonl")]
-    pub file: PathBuf,
-}
-
-/// Arguments for the tutorial subcommand.
-#[derive(Parser, Debug)]
-struct TutorialArgs {
-    /// Skip prompts and print the tutorial in one pass
-    #[arg(long)]
-    no_input: bool,
-}
-
-/// Arguments for the plan subcommand.
-///
-/// Starts an interactive PDD (Prompt-Driven Development) session.
-/// This is a thin wrapper that spawns the AI backend with the bundled
-/// PDD SOP, bypassing Ralph's event loop entirely.
-#[derive(Parser, Debug)]
-struct PlanArgs {
-    /// The rough idea to develop (optional - SOP will prompt if not provided)
-    #[arg(value_name = "IDEA")]
-    idea: Option<String>,
-
-    /// Backend to use (overrides config and auto-detection)
-    #[arg(short, long, value_name = "BACKEND")]
-    backend: Option<String>,
-
-    /// Enable Claude Code's experimental Agent Teams feature
-    #[arg(long)]
-    teams: bool,
-
-    /// Custom backend command and arguments (use after --)
-    #[arg(last = true)]
-    custom_args: Vec<String>,
-}
-
-/// Arguments for the task subcommand.
-///
-/// Starts an interactive code-task-generator session.
-/// This is a thin wrapper that spawns the AI backend with the bundled
-/// code-task-generator SOP, bypassing Ralph's event loop entirely.
-#[derive(Parser, Debug)]
-struct CodeTaskArgs {
-    /// Input: description text or path to PDD plan file
-    #[arg(value_name = "INPUT")]
-    input: Option<String>,
-
-    /// Backend to use (overrides config and auto-detection)
-    #[arg(short, long, value_name = "BACKEND")]
-    backend: Option<String>,
-
-    /// Enable Claude Code's experimental Agent Teams feature
-    #[arg(long)]
-    teams: bool,
-
-    /// Custom backend command and arguments (use after --)
-    #[arg(last = true)]
-    custom_args: Vec<String>,
-}
-
 /// Arguments for the `ralph tui` subcommand.
 #[derive(Parser, Debug)]
 struct TuiArgs {
@@ -924,14 +780,6 @@ struct TuiArgs {
     /// Defaults to RALPH_API_URL env var, or http://127.0.0.1:3000.
     #[arg(short = 'u', long = "url")]
     url: Option<String>,
-}
-
-/// Arguments for the completions subcommand.
-#[derive(Parser, Debug)]
-struct CompletionsArgs {
-    /// Shell to generate completions for
-    #[arg(value_enum)]
-    shell: clap_complete::Shell,
 }
 
 async fn tui_command(args: TuiArgs) -> Result<()> {
@@ -948,30 +796,6 @@ async fn tui_command(args: TuiArgs) -> Result<()> {
         Tui::connect(&url).with_context(|| format!("Failed to create TUI client for {url}"))?;
 
     tui.run().await.context("TUI exited with error")
-}
-
-fn completions_command(args: CompletionsArgs) -> Result<()> {
-    use clap_complete::generate;
-    use std::io::ErrorKind;
-
-    let mut cli = Cli::command();
-
-    // Generate into a buffer first so we can handle broken pipe errors
-    // from shell consumers like `| head` without surfacing a panic.
-    let mut output = Vec::new();
-    generate(args.shell, &mut cli, "ralph", &mut output);
-
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_all(&output).or_else(|e| {
-        if e.kind() == ErrorKind::BrokenPipe {
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })?;
-
-    Ok(())
 }
 
 /// Returns true if the given command is eligible for diagnostics session creation.
@@ -1143,7 +967,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Tutorial(args)) => tutorial_command(cli.color, args),
+        Some(Commands::Tutorial(args)) => commands::tutorial::run(cli.color, args),
         Some(Commands::Resume(args)) => {
             resume_command(
                 &config_sources,
@@ -1154,18 +978,20 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Events(args)) => events_command(cli.color, args),
-        Some(Commands::Init(args)) => init_command(cli.color, args),
-        Some(Commands::Clean(args)) => clean_command(&config_sources, cli.color, args),
-        Some(Commands::Emit(args)) => emit_command(cli.color, args),
+        Some(Commands::Events(args)) => commands::events::run(cli.color, args),
+        Some(Commands::Init(args)) => commands::init::run(cli.color, args),
+        Some(Commands::Clean(args)) => commands::clean::run(&config_sources, cli.color, args),
+        Some(Commands::Emit(args)) => commands::emit::run(cli.color, args),
         Some(Commands::Plan(args)) => {
-            plan_command(&config_sources, hats_source.as_ref(), cli.color, args).await
+            commands::plan::run_plan(&config_sources, hats_source.as_ref(), cli.color, args).await
         }
         Some(Commands::CodeTask(args)) => {
-            code_task_command(&config_sources, hats_source.as_ref(), cli.color, args).await
+            commands::plan::run_code_task(&config_sources, hats_source.as_ref(), cli.color, args)
+                .await
         }
         Some(Commands::Task(args)) => {
-            code_task_command(&config_sources, hats_source.as_ref(), cli.color, args).await
+            commands::plan::run_code_task(&config_sources, hats_source.as_ref(), cli.color, args)
+                .await
         }
         Some(Commands::Tools(args)) => tools::execute(args, cli.color.should_use_colors()).await,
         Some(Commands::Wave(args)) => wave::execute(args, cli.color.should_use_colors()),
@@ -1191,7 +1017,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Completions(args)) => completions_command(args),
+        Some(Commands::Completions(args)) => commands::completions::run(args),
         None => {
             // Default to run with TUI enabled (new default behavior)
             let args = RunArgs {
@@ -2182,637 +2008,15 @@ async fn resume_command(
     Ok(())
 }
 
-fn init_command(color_mode: ColorMode, args: InitArgs) -> Result<()> {
-    let use_colors = color_mode.should_use_colors();
-
-    // Handle --list-presets (lists builtin hat collections)
-    if args.list_presets {
-        println!("{}", init::format_preset_list());
-        return Ok(());
-    }
-
-    // Hard cutover: --preset no longer writes monolithic config.
-    if let Some(preset) = args.preset {
-        anyhow::bail!(
-            "`ralph init --preset {preset}` was removed.\n\nUse split config:\n  1) Create core config: ralph init --backend <backend>\n  2) Run with hats:     ralph run -c ralph.yml -H builtin:{preset}"
-        );
-    }
-
-    // Handle --backend alone (minimal config)
-    if let Some(backend) = args.backend {
-        match init::init_from_backend(&backend, args.force) {
-            Ok(()) => {
-                if use_colors {
-                    println!(
-                        "{}✓{} Created ralph.yml with {} backend",
-                        colors::GREEN,
-                        colors::RESET,
-                        backend
-                    );
-                    println!(
-                        "\n{}Next steps:{}\n  1. Create PROMPT.md with your task\n  2. Run core-only: ralph run -c ralph.yml\n  3. Or with hats:  ralph run -c ralph.yml -H builtin:code-assist",
-                        colors::DIM,
-                        colors::RESET
-                    );
-                } else {
-                    println!("Created ralph.yml with {} backend", backend);
-                    println!(
-                        "\nNext steps:\n  1. Create PROMPT.md with your task\n  2. Run core-only: ralph run -c ralph.yml\n  3. Or with hats:  ralph run -c ralph.yml -H builtin:code-assist"
-                    );
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                anyhow::bail!("{}", e);
-            }
-        }
-    }
-
-    // No flag specified - show help
-    println!("Initialize a new ralph.yml configuration file.\n");
-    println!("Usage:");
-    println!("  ralph init --backend <backend>   Generate core config (ralph.yml)");
-    println!("  ralph init --list-presets        Show builtin hat collections\n");
-    println!("Backends: {}", backend_support::VALID_BACKENDS_LABEL);
-    println!("\nThen run with hats, e.g.: ralph run -c ralph.yml -H builtin:code-assist");
-
-    Ok(())
-}
-
-fn events_command(color_mode: ColorMode, args: EventsArgs) -> Result<()> {
-    let use_colors = color_mode.should_use_colors();
-    let workspace_root = resolve_workspace_root(None);
-    let current_events_marker = workspace_root.join(".ralph/current-events");
-
-    // Read events path from marker file, fall back to default if marker doesn't exist
-    // This ensures `ralph events` reads from the same events file as the active run
-    let history = match args.file {
-        Some(path) => EventHistory::new(path),
-        None => fs::read_to_string(&current_events_marker)
-            .map(|s| EventHistory::new(resolve_marker_target(&workspace_root, &s)))
-            .unwrap_or_else(|_| EventHistory::new(workspace_root.join(".ralph/events.jsonl"))),
-    };
-
-    // Handle clear command
-    if args.clear {
-        history.clear()?;
-        if use_colors {
-            println!("{}✓{} Event history cleared", colors::GREEN, colors::RESET);
-        } else {
-            println!("Event history cleared");
-        }
-        return Ok(());
-    }
-
-    if !history.exists() {
-        if use_colors {
-            println!(
-                "{}No event history found.{} Run `ralph` to generate events.",
-                colors::DIM,
-                colors::RESET
-            );
-        } else {
-            println!("No event history found. Run `ralph` to generate events.");
-        }
-        return Ok(());
-    }
-
-    // Read and filter events
-    let mut records = history.read_all()?;
-
-    // Apply filters in sequence
-    if let Some(ref topic) = args.topic {
-        records.retain(|r| r.topic == *topic);
-    }
-
-    if let Some(iteration) = args.iteration {
-        records.retain(|r| r.iteration == iteration);
-    }
-
-    // Apply 'last' filter after other filters (to get last N of filtered results)
-    if let Some(n) = args.last
-        && records.len() > n
-    {
-        records = records.into_iter().rev().take(n).rev().collect();
-    }
-
-    if records.is_empty() {
-        if use_colors {
-            println!("{}No matching events found.{}", colors::DIM, colors::RESET);
-        } else {
-            println!("No matching events found.");
-        }
-        return Ok(());
-    }
-
-    match args.format {
-        OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&records)?;
-            println!("{json}");
-        }
-        OutputFormat::Table => {
-            display::print_events_table(&records, use_colors);
-        }
-    }
-
-    Ok(())
-}
-
-fn clean_command(
-    config_sources: &[ConfigSource],
-    color_mode: ColorMode,
-    args: CleanArgs,
-) -> Result<()> {
-    let use_colors = color_mode.should_use_colors();
-
-    // If --diagnostics flag is set, clean diagnostics directory
-    if args.diagnostics {
-        let workspace_root = std::env::current_dir().context("Failed to get current directory")?;
-        return ralph_cli::clean_diagnostics(&workspace_root, use_colors, args.dry_run);
-    }
-
-    // Load config with overrides applied
-    let config = load_config_with_overrides(config_sources)?;
-
-    // Extract the .agent directory path from scratchpad path
-    let scratchpad_path = Path::new(&config.core.scratchpad.path);
-    let agent_dir = scratchpad_path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not determine parent directory from scratchpad path: {}",
-            config.core.scratchpad.path
-        )
-    })?;
-
-    // Check if directory exists
-    if !agent_dir.exists() {
-        // Not an error - just inform user
-        if use_colors {
-            println!(
-                "{}Nothing to clean:{} Directory '{}' does not exist",
-                colors::DIM,
-                colors::RESET,
-                agent_dir.display()
-            );
-        } else {
-            println!(
-                "Nothing to clean: Directory '{}' does not exist",
-                agent_dir.display()
-            );
-        }
-        return Ok(());
-    }
-
-    // Dry run mode - list what would be deleted
-    if args.dry_run {
-        if use_colors {
-            println!(
-                "{}Dry run mode:{} Would delete directory and all contents:",
-                colors::CYAN,
-                colors::RESET
-            );
-        } else {
-            println!("Dry run mode: Would delete directory and all contents:");
-        }
-        println!("  {}", agent_dir.display());
-
-        // List directory contents
-        list_directory_contents(agent_dir, use_colors, 1)?;
-
-        return Ok(());
-    }
-
-    // Perform actual deletion
-    fs::remove_dir_all(agent_dir).with_context(|| {
-        format!(
-            "Failed to delete directory '{}'. Check permissions and try again.",
-            agent_dir.display()
-        )
-    })?;
-
-    // Success message
-    if use_colors {
-        println!(
-            "{}✓{} Cleaned: Deleted '{}' and all contents",
-            colors::GREEN,
-            colors::RESET,
-            agent_dir.display()
-        );
-    } else {
-        println!(
-            "Cleaned: Deleted '{}' and all contents",
-            agent_dir.display()
-        );
-    }
-
-    Ok(())
-}
-
-/// Emit an event to the current run's events file with proper JSON formatting.
-///
-/// This command provides a deterministic way for agents to emit events without
-/// risking malformed JSONL from manual echo commands. All JSON serialization
-/// is handled via serde_json, ensuring proper escaping of payloads.
-///
-/// Events are written to the path specified in `.ralph/current-events` marker file
-/// (created by `ralph run`), or falls back to `.ralph/events.jsonl` if no marker exists.
-fn emit_command(color_mode: ColorMode, args: EmitArgs) -> Result<()> {
-    emit_command_with_root(color_mode, args, None)
-}
-
-fn emit_command_with_root(
-    color_mode: ColorMode,
-    args: EmitArgs,
-    root: Option<&PathBuf>,
-) -> Result<()> {
-    let use_colors = color_mode.should_use_colors();
-    let workspace_root = resolve_workspace_root(root);
-    let current_events_marker = workspace_root.join(".ralph/current-events");
-
-    if std::env::var("RALPH_WAVE_ID").is_err() {
-        let urgent_steer_store = UrgentSteerStore::new(urgent_steer_path_from_workspace(root));
-        if let Some(record) = urgent_steer_store
-            .take()
-            .context("Failed to read urgent-steer marker")?
-        {
-            let guidance = record
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(idx, message)| format!("{}. {}", idx + 1, message))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            anyhow::bail!(
-                "Urgent steer is pending. Do not hand off yet.\n\n\
-                 Human feedback:\n{guidance}\n\n\
-                 You have now seen the steer. Address it in this turn, then rerun `ralph emit` \
-                 once you are ready to hand off."
-            );
-        }
-    }
-
-    // Generate timestamp if not provided
-    let ts = args.ts.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-
-    // Validate JSON payload if --json flag is set
-    let payload = if args.json && !args.payload.is_empty() {
-        // Validate it's valid JSON
-        serde_json::from_str::<serde_json::Value>(&args.payload).context("Invalid JSON payload")?;
-        args.payload
-    } else {
-        args.payload
-    };
-
-    // Build the event record
-    // We use serde_json directly to ensure proper escaping
-    let payload_value = if args.json && !payload.is_empty() {
-        // Parse and embed as object
-        serde_json::from_str::<serde_json::Value>(&payload)?
-    } else if payload.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(payload)
-    };
-
-    let mut record = serde_json::json!({
-        "topic": args.topic,
-        "payload": payload_value,
-        "ts": ts
-    });
-
-    // Auto-tag with wave metadata from env vars (set by loop runner on wave workers)
-    if let (Ok(wave_id), Ok(wave_index_str)) = (
-        std::env::var("RALPH_WAVE_ID"),
-        std::env::var("RALPH_WAVE_INDEX"),
-    ) && let Ok(wave_index) = wave_index_str.parse::<u32>()
-    {
-        record["wave_id"] = serde_json::Value::String(wave_id);
-        record["wave_index"] = serde_json::Value::Number(wave_index.into());
-    }
-
-    // Resolve events file: RALPH_EVENTS_FILE env > marker file > CLI arg
-    // This ensures `ralph emit` writes to the same events file as the active run
-    let events_file = if let Ok(path) = std::env::var("RALPH_EVENTS_FILE") {
-        PathBuf::from(path)
-    } else {
-        fs::read_to_string(&current_events_marker)
-            .map(|s| resolve_marker_target(&workspace_root, &s))
-            .unwrap_or_else(|_| args.file.clone())
-    };
-
-    // Ensure parent directory exists
-    if let Some(parent) = events_file.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-    }
-
-    // Append to file
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&events_file)
-        .with_context(|| format!("Failed to open events file: {}", events_file.display()))?;
-
-    // Write as single-line JSON (JSONL format)
-    let json_line = serde_json::to_string(&record)?;
-    writeln!(file, "{}", json_line)?;
-
-    // Success message
-    if use_colors {
-        println!(
-            "{}✓{} Event emitted: {}",
-            colors::GREEN,
-            colors::RESET,
-            args.topic
-        );
-    } else {
-        println!("Event emitted: {}", args.topic);
-    }
-
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TutorialStep {
-    title: &'static str,
-    body: &'static [&'static str],
-}
-
-const TUTORIAL_STEPS: &[TutorialStep] = &[
-    TutorialStep {
-        title: "Hats: Event-driven personas",
-        body: &[
-            "Hats are named personas that subscribe to events and publish new events.",
-            "Each hat lists triggers (ex: task.start) and outputs (ex: build.task).",
-            "Inspect hats with: ralph hats list",
-            "Visualize the flow with: ralph hats graph --format ascii",
-        ],
-    },
-    TutorialStep {
-        title: "Hat collections: Swappable workflows",
-        body: &[
-            "Core config and hat collections are split.",
-            "List built-in hat collections: ralph init --list-presets",
-            "Create core config: ralph init --backend <name>",
-            "Run with hats: ralph run -c ralph.yml -H builtin:code-assist",
-        ],
-    },
-    TutorialStep {
-        title: "Workflow: The loop lifecycle",
-        body: &[
-            "Write a prompt file (ex: PROMPT.md) or pass --prompt/--prompt-file.",
-            "Run: ralph run -P PROMPT.md or ralph run -p \"...\"",
-            "Ralph emits task.start, hats process events, and the loop ends on done events.",
-            "Artifacts live in .ralph/agent (scratchpad, tasks, memories).",
-            "Check open tasks with: ralph tools task ready",
-        ],
-    },
-];
-
-fn tutorial_steps() -> &'static [TutorialStep] {
-    TUTORIAL_STEPS
-}
-
-/// Runs the interactive tutorial walkthrough.
-fn tutorial_command(color_mode: ColorMode, args: TutorialArgs) -> Result<()> {
-    let use_colors = color_mode.should_use_colors();
-    let interactive = !args.no_input && std::io::stdin().is_terminal();
-    let steps = tutorial_steps();
-
-    print_tutorial_intro(use_colors, interactive);
-
-    for (index, step) in steps.iter().enumerate() {
-        print_tutorial_step(index + 1, steps.len(), step, use_colors);
-        if interactive && index + 1 < steps.len() {
-            prompt_to_continue(use_colors)?;
-        } else {
-            println!();
-        }
-    }
-
-    print_tutorial_outro(use_colors);
-    Ok(())
-}
-
-fn print_tutorial_intro(use_colors: bool, interactive: bool) {
-    if use_colors {
-        println!(
-            "{}{}Ralph Tutorial{}",
-            colors::BOLD,
-            colors::CYAN,
-            colors::RESET
-        );
-        println!(
-            "{}Interactive walkthrough of hats, hat collections, and workflow.{}",
-            colors::DIM,
-            colors::RESET
-        );
-    } else {
-        println!("Ralph Tutorial");
-        println!("Interactive walkthrough of hats, hat collections, and workflow.");
-    }
-
-    if !interactive {
-        println!("Non-interactive mode: printing all steps.");
-    }
-
-    println!();
-}
-
-fn print_tutorial_step(index: usize, total: usize, step: &TutorialStep, use_colors: bool) {
-    if use_colors {
-        println!(
-            "{}{}Step {}/{}: {}{}",
-            colors::BOLD,
-            colors::CYAN,
-            index,
-            total,
-            step.title,
-            colors::RESET
-        );
-    } else {
-        println!("Step {}/{}: {}", index, total, step.title);
-    }
-
-    for line in step.body {
-        println!("  - {}", line);
-    }
-}
-
-fn prompt_to_continue(use_colors: bool) -> Result<()> {
-    if use_colors {
-        print!("{}Press Enter to continue...{}", colors::DIM, colors::RESET);
-    } else {
-        print!("Press Enter to continue...");
-    }
-
-    stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    println!();
-    Ok(())
-}
-
-fn print_tutorial_outro(use_colors: bool) {
-    if use_colors {
-        println!(
-            "{}Tutorial complete. Next: ralph init --backend <name>, then ralph run -c ralph.yml -H builtin:code-assist.{}",
-            colors::GREEN,
-            colors::RESET
-        );
-    } else {
-        println!(
-            "Tutorial complete. Next: ralph init --backend <name>, then ralph run -c ralph.yml -H builtin:code-assist."
-        );
-    }
-}
-
-/// Starts a Prompt-Driven Development planning session.
-///
-/// This is a thin wrapper that bypasses Ralph's event loop entirely.
-/// It spawns the AI backend with the bundled PDD SOP for interactive planning.
-async fn plan_command(
-    config_sources: &[ConfigSource],
-    hats_source: Option<&HatsSource>,
-    color_mode: ColorMode,
-    args: PlanArgs,
-) -> Result<()> {
-    use sop_runner::{Sop, SopRunConfig, SopRunError};
-
-    let use_colors = color_mode.should_use_colors();
-
-    // Show what we're starting
-    if use_colors {
-        println!(
-            "{}🎯{} Starting {} session...",
-            colors::CYAN,
-            colors::RESET,
-            Sop::Pdd.name()
-        );
-    } else {
-        println!("Starting {} session...", Sop::Pdd.name());
-    }
-
-    let config = preflight::load_config_for_preflight(config_sources, hats_source).await?;
-
-    let config = SopRunConfig {
-        sop: Sop::Pdd,
-        user_input: args.idea,
-        backend_override: args.backend,
-        config: Some(config),
-        config_path: None,
-        custom_args: if args.custom_args.is_empty() {
-            None
-        } else {
-            Some(args.custom_args)
-        },
-        agent_teams: args.teams,
-    };
-
-    sop_runner::run_sop(config).map_err(|e| match e {
-        SopRunError::NoBackend(no_backend) => anyhow::Error::new(no_backend),
-        SopRunError::UnknownBackend(msg) => anyhow::anyhow!("{}", msg),
-        SopRunError::SpawnError(io_err) => anyhow::anyhow!("Failed to spawn backend: {}", io_err),
-    })
-}
-
-/// Starts a code-task-generator session.
-///
-/// This is a thin wrapper that bypasses Ralph's event loop entirely.
-/// It spawns the AI backend with the bundled code-task-generator SOP.
-async fn code_task_command(
-    config_sources: &[ConfigSource],
-    hats_source: Option<&HatsSource>,
-    color_mode: ColorMode,
-    args: CodeTaskArgs,
-) -> Result<()> {
-    use sop_runner::{Sop, SopRunConfig, SopRunError};
-
-    let use_colors = color_mode.should_use_colors();
-
-    // Show what we're starting
-    if use_colors {
-        println!(
-            "{}📋{} Starting {} session...",
-            colors::CYAN,
-            colors::RESET,
-            Sop::CodeTaskGenerator.name()
-        );
-    } else {
-        println!("Starting {} session...", Sop::CodeTaskGenerator.name());
-    }
-
-    let config = preflight::load_config_for_preflight(config_sources, hats_source).await?;
-
-    let config = SopRunConfig {
-        sop: Sop::CodeTaskGenerator,
-        user_input: args.input,
-        backend_override: args.backend,
-        config: Some(config),
-        config_path: None,
-        custom_args: if args.custom_args.is_empty() {
-            None
-        } else {
-            Some(args.custom_args)
-        },
-        agent_teams: args.teams,
-    };
-
-    sop_runner::run_sop(config).map_err(|e| match e {
-        SopRunError::NoBackend(no_backend) => anyhow::Error::new(no_backend),
-        SopRunError::UnknownBackend(msg) => anyhow::anyhow!("{}", msg),
-        SopRunError::SpawnError(io_err) => anyhow::anyhow!("Failed to spawn backend: {}", io_err),
-    })
-}
-
-/// Lists directory contents recursively for dry-run mode.
-fn list_directory_contents(path: &Path, use_colors: bool, indent: usize) -> Result<()> {
-    let entries = fs::read_dir(path)?;
-    let indent_str = "  ".repeat(indent);
-
-    for entry in entries {
-        let entry = entry?;
-        let entry_path = entry.path();
-        let file_name = entry.file_name();
-
-        if entry_path.is_dir() {
-            if use_colors {
-                println!(
-                    "{}{}{}/{}",
-                    indent_str,
-                    colors::BLUE,
-                    file_name.to_string_lossy(),
-                    colors::RESET
-                );
-            } else {
-                println!("{}{}/", indent_str, file_name.to_string_lossy());
-            }
-            list_directory_contents(&entry_path, use_colors, indent + 1)?;
-        } else if use_colors {
-            println!(
-                "{}{}{}{}",
-                indent_str,
-                colors::DIM,
-                file_name.to_string_lossy(),
-                colors::RESET
-            );
-        } else {
-            println!("{}{}", indent_str, file_name.to_string_lossy());
-        }
-    }
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::emit::{EmitArgs, run_with_root as emit_command_with_root};
+    use crate::commands::events::EventsArgs;
+    use crate::commands::tutorial::tutorial_steps;
     use crate::test_support::CwdGuard;
-    use ralph_core::{HookMutationConfig, HookOnError, HookPhaseEvent, HookSpec};
+    use ralph_core::{HookMutationConfig, HookOnError, HookPhaseEvent, HookSpec, UrgentSteerStore};
     use std::path::PathBuf;
     use tempfile::TempDir;
     #[test]
@@ -3651,25 +2855,6 @@ core:
         let actual_root = std::fs::canonicalize(&config.core.workspace_root)
             .unwrap_or_else(|_| config.core.workspace_root.clone());
         assert_eq!(actual_root, expected_root);
-    }
-
-    #[test]
-    fn test_list_directory_contents_handles_nested_paths() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let nested_dir = temp_dir.path().join("one/two");
-        std::fs::create_dir_all(&nested_dir).unwrap();
-        std::fs::write(temp_dir.path().join("one/file.txt"), "hello").unwrap();
-
-        assert!(list_directory_contents(temp_dir.path(), false, 0).is_ok());
-        assert!(list_directory_contents(temp_dir.path(), true, 0).is_ok());
-    }
-
-    #[test]
-    fn test_list_directory_contents_missing_path_returns_error() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let missing = temp_dir.path().join("missing");
-
-        assert!(list_directory_contents(&missing, false, 0).is_err());
     }
 
     #[test]
