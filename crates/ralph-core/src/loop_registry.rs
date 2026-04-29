@@ -568,6 +568,39 @@ mod tests {
         assert_eq!(loops[0].prompt, "prompt 2");
     }
 
+    /// Returns a PID that is not currently live, by probing with signal 0.
+    ///
+    /// On busy hosts, low PIDs like 99999 may collide with real processes, so
+    /// we search the high end of the PID space for a free slot. This is used
+    /// by tests that need to simulate a stale registry entry.
+    #[cfg(unix)]
+    fn find_dead_pid() -> u32 {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        // Start near the top of the 32-bit signed PID space and walk down.
+        // Linux's /proc/sys/kernel/pid_max is typically 4_194_304 on 64-bit
+        // systems, so PIDs above that cannot exist.
+        let mut candidate: i32 = i32::MAX;
+        for _ in 0..10_000 {
+            match kill(Pid::from_raw(candidate), None) {
+                Err(Errno::ESRCH) => return candidate as u32,
+                // Any other result (Ok, EPERM, etc.) means the PID maps to
+                // something — try a different one.
+                _ => candidate -= 1,
+            }
+        }
+        panic!("could not find a dead PID after 10000 attempts");
+    }
+
+    #[cfg(not(unix))]
+    fn find_dead_pid() -> u32 {
+        // On non-Unix, is_pid_alive() always returns true, so any value works
+        // but the test would be meaningless. Keep the old sentinel.
+        99999
+    }
+
     #[test]
     fn test_registry_different_pids_coexist() {
         // Entries with different PIDs should coexist
@@ -579,9 +612,14 @@ mod tests {
         let id1 = entry1.id.clone();
         registry.register(entry1).unwrap();
 
+        // Pick a PID that provably isn't live on this host. Hard-coded low
+        // PIDs (like 99999) collide with real processes on busy hosts; probe
+        // with kill(pid, 0) to find a free slot instead.
+        let dead_pid = find_dead_pid();
+
         // Manually create entry with different PID (simulating another process)
         let mut entry2 = LoopEntry::new("prompt 2", Some("/worktree"));
-        entry2.pid = 99999; // Fake PID - won't exist so will be cleaned as stale
+        entry2.pid = dead_pid;
         let id2 = entry2.id.clone();
 
         // Write entry2 directly to file to bypass PID check
@@ -591,7 +629,7 @@ mod tests {
         let loops = data["loops"].as_array_mut().unwrap();
         loops.push(serde_json::json!({
             "id": id2,
-            "pid": 99999,
+            "pid": dead_pid,
             "started": entry2.started,
             "prompt": "prompt 2",
             "worktree_path": "/worktree",
@@ -599,7 +637,7 @@ mod tests {
         }));
         fs::write(&registry_path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
 
-        // List should clean the stale entry (PID 99999 doesn't exist)
+        // List should clean the stale entry (the dead PID doesn't exist)
         // But our current process entry should remain
         let loops = registry.list().unwrap();
         assert_eq!(loops.len(), 1);

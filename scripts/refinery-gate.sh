@@ -12,12 +12,9 @@
 #            `duration_suboptimal_units` lint which fires 30+ times on
 #            mainline. Enable after that's fixed (tracked separately).
 #
-# The test subcommand skips two pre-existing failures:
+# The test subcommand skips one pre-existing failure:
 #   - acp_executor::tests::test_create_terminal_and_output (matches CI skip in
 #     .github/workflows/ci.yml via scripts/ci-rust-gate.sh)
-#   - loop_registry::tests::test_registry_different_pids_coexist (flaky:
-#     hard-codes PID 99999 which collides with real processes on busy hosts;
-#     tracked in ro-aiav)
 
 set -euo pipefail
 
@@ -34,8 +31,6 @@ done < <(git rev-parse --local-env-vars 2>/dev/null || true)
 CARGO_TEST_SKIPS=(
   # Matches CI skip in scripts/ci-rust-gate.sh
   --skip acp_executor::tests::test_create_terminal_and_output
-  # Flaky: hard-coded PID 99999 exists on busy hosts (ro-aiav)
-  --skip loop_registry::tests::test_registry_different_pids_coexist
 )
 
 log() {
