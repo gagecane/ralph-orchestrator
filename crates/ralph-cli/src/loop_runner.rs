@@ -5646,7 +5646,9 @@ async fn execute_wave_worker_acp_prompt(
     #[cfg(test)]
     {
         if let Some(mock) = {
-            let mut queued = MOCK_ACP_EXECUTIONS.lock().expect("mock ACP execution lock");
+            let mut queued = MOCK_ACP_EXECUTIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             queued.pop_front()
         } {
             mock.write_capture(worker_backend, prompt, _worker_events_path);
@@ -6296,6 +6298,7 @@ mod tests {
     #[cfg(unix)]
     struct FakePathBackendsGuard {
         _guard: std::sync::MutexGuard<'static, ()>,
+        _cwd_lock: crate::test_support::CwdSerialGuard,
         _temp_dir: tempfile::TempDir,
         installed_paths: Vec<std::path::PathBuf>,
     }
@@ -6306,17 +6309,26 @@ mod tests {
             for path in &self.installed_paths {
                 let _ = std::fs::remove_file(path);
             }
+            // Recover from PoisonError so one panicking test does not cascade
+            // into every subsequent test that touches the fake-PATH backend.
             *FAKE_PATH_BACKEND_BIN
                 .lock()
-                .expect("fake PATH backend bin lock") = None;
+                .unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 
     #[cfg(unix)]
     fn install_fake_path_backends(backends: &[(&str, &str)]) -> FakePathBackendsGuard {
+        // Recover from PoisonError so a panic in any prior test that held this
+        // lock does not cascade PoisonError into every subsequent wave test.
+        // Also acquire the cwd serial lock so wave tests (which snapshot
+        // std::env::current_dir() for the PTY child's cwd) can not race with
+        // test_support::CwdGuard-holding tests. The cwd lock is reentrant,
+        // so nested wave-helper calls do not deadlock.
         let guard = FAKE_PATH_BACKEND_SERIAL
             .lock()
-            .expect("fake PATH backend serial lock");
+            .unwrap_or_else(|e| e.into_inner());
+        let cwd_lock = crate::test_support::cwd_serial_guard();
         let temp_dir = tempfile::tempdir().expect("fake backend temp dir");
         let bin_dir = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("fake backend bin dir");
@@ -6333,10 +6345,11 @@ mod tests {
         }
         *FAKE_PATH_BACKEND_BIN
             .lock()
-            .expect("fake PATH backend bin lock") = Some(bin_dir.clone());
+            .unwrap_or_else(|e| e.into_inner()) = Some(bin_dir.clone());
 
         FakePathBackendsGuard {
             _guard: guard,
+            _cwd_lock: cwd_lock,
             _temp_dir: temp_dir,
             installed_paths,
         }
@@ -6352,7 +6365,7 @@ mod tests {
         fn drop(&mut self) {
             MOCK_ACP_EXECUTIONS
                 .lock()
-                .expect("mock ACP execution queue")
+                .unwrap_or_else(|e| e.into_inner())
                 .clear();
         }
     }
@@ -6361,10 +6374,10 @@ mod tests {
     fn install_mock_acp_executions(executions: Vec<MockAcpExecution>) -> MockAcpExecutionGuard {
         let guard = MOCK_ACP_EXECUTION_SERIAL
             .lock()
-            .expect("mock ACP execution serial lock");
+            .unwrap_or_else(|e| e.into_inner());
         *MOCK_ACP_EXECUTIONS
             .lock()
-            .expect("mock ACP execution queue") = executions.into_iter().collect();
+            .unwrap_or_else(|e| e.into_inner()) = executions.into_iter().collect();
         MockAcpExecutionGuard { _guard: guard }
     }
 
@@ -9964,6 +9977,9 @@ hats:
         timeout_secs: u32,
         env_vars: Vec<(&str, &str)>,
     ) -> ralph_core::CompletedWave {
+        // Serialize with test_support::CwdGuard tests — see note on
+        // run_wave_for_named_backend_with_capture_and_task_payload.
+        let _cwd_lock = crate::test_support::cwd_serial_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let bin_dir = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
@@ -9990,6 +10006,9 @@ hats:
 
     #[cfg(unix)]
     async fn run_wave_for_named_backend(name: &str, body: &str) -> ralph_core::CompletedWave {
+        // Serialize with test_support::CwdGuard tests — see note on
+        // run_wave_for_named_backend_with_capture_and_task_payload.
+        let _cwd_lock = crate::test_support::cwd_serial_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let bin_dir = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
@@ -10044,6 +10063,11 @@ hats:
         payload: &str,
         task_payload: &str,
     ) -> (ralph_core::CompletedWave, CapturedWaveInvocation) {
+        // execute_wave snapshots std::env::current_dir() for the PTY child's
+        // cwd. Serialize with test_support::CwdGuard tests (which mutate
+        // process cwd) so the snapshot can not see a deleted tempdir and
+        // PTY spawn does not race-fail with "No such file or directory".
+        let _cwd_lock = crate::test_support::cwd_serial_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let bin_dir = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("bin dir");
@@ -10098,7 +10122,7 @@ hats:
 
         if let Some(bin_dir) = FAKE_PATH_BACKEND_BIN
             .lock()
-            .expect("fake PATH backend bin lock")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
         {
             let existing_path = std::env::var("PATH").unwrap_or_default();
@@ -10119,6 +10143,11 @@ hats:
         backend_args: Option<Vec<String>>,
         global_backend: CliBackend,
     ) -> ralph_core::CompletedWave {
+        // Serialize with test_support::CwdGuard tests — see note on
+        // run_wave_for_named_backend_with_capture_and_task_payload. The cwd
+        // lock is reentrant, so callers that already hold it via
+        // install_fake_path_backends are not deadlocked.
+        let _cwd_lock = crate::test_support::cwd_serial_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let events_file = temp_dir.path().join("events.jsonl");
         let mut wave = make_test_wave(vec!["review.done".to_string()]);
@@ -10157,6 +10186,11 @@ hats:
         backend_args: Option<Vec<String>>,
         task_payload: &str,
     ) -> (ralph_core::CompletedWave, CapturedWaveInvocation) {
+        // Serialize with test_support::CwdGuard tests — see note on
+        // run_wave_for_named_backend_with_capture_and_task_payload. Reentrant
+        // via a thread-local depth counter, so callers that already hold the
+        // cwd lock via install_fake_path_backends are not deadlocked.
+        let _cwd_lock = crate::test_support::cwd_serial_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let worker_capture_path = temp_dir.path().join("wave-w-test-0.jsonl.capture");
         let events_file = temp_dir.path().join("events.jsonl");
