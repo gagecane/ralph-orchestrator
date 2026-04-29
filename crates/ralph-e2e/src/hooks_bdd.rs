@@ -1043,6 +1043,33 @@ fn assert_workspace_source_contains(
     assert_required_source_snippets(relative_path, &source_content, required_snippets)
 }
 
+/// Like `assert_workspace_source_contains` but searches across multiple
+/// sibling files, treating them as one logical source unit.
+///
+/// Used after a module split where probe strings (implementation code vs test
+/// function bodies) have been extracted into separate files: each snippet
+/// needs to appear in at least one of the listed files.
+fn assert_workspace_source_contains_any(
+    relative_paths: &[&str],
+    required_snippets: &[(&str, &str)],
+) -> Result<(), String> {
+    if relative_paths.is_empty() {
+        return Err(
+            "assert_workspace_source_contains_any called with no paths".to_string(),
+        );
+    }
+
+    let mut combined = String::new();
+    for path in relative_paths {
+        let content = load_workspace_source_file(path)?;
+        combined.push_str(&content);
+        combined.push('\n');
+    }
+
+    let label = relative_paths.join(", ");
+    assert_required_source_snippets(&label, &combined, required_snippets)
+}
+
 // =============================================================================
 // AC-01: Per-project scope only
 // =============================================================================
@@ -1543,8 +1570,11 @@ fn evaluate_ac_08(
                 )],
             )?;
 
-            assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner/mod.rs",
+            assert_workspace_source_contains_any(
+                &[
+                    "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/tests.rs",
+                ],
                 &[
                     (
                         "warn policy maps to warn disposition",
@@ -1608,8 +1638,11 @@ fn evaluate_ac_09(
                 )],
             )?;
 
-            assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner/mod.rs",
+            assert_workspace_source_contains_any(
+                &[
+                    "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/tests.rs",
+                ],
                 &[
                     (
                         "block policy maps to block disposition",
@@ -1815,8 +1848,11 @@ fn evaluate_ac_13(
         ci_safe_mode,
         validate_acceptance_context,
         |_harness| {
-            assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner/mod.rs",
+            assert_workspace_source_contains_any(
+                &[
+                    "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/tests.rs",
+                ],
                 &[
                     (
                         "mutation parser short-circuits when mutate.enabled is false",
@@ -1869,8 +1905,11 @@ fn evaluate_ac_14(
         ci_safe_mode,
         validate_acceptance_context,
         |_harness| {
-            assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner/mod.rs",
+            assert_workspace_source_contains_any(
+                &[
+                    "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/tests.rs",
+                ],
                 &[
                     (
                         "mutation payload parser enforces metadata-only top-level schema",
@@ -1927,8 +1966,11 @@ fn evaluate_ac_15(
         ci_safe_mode,
         validate_acceptance_context,
         |_harness| {
-            assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner/mod.rs",
+            assert_workspace_source_contains_any(
+                &[
+                    "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/tests.rs",
+                ],
                 &[
                     (
                         "mutation parser attempts JSON decode of hook stdout",
@@ -2068,8 +2110,11 @@ fn evaluate_ac_16(
                 ],
             )?;
 
-            assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner/mod.rs",
+            assert_workspace_source_contains_any(
+                &[
+                    "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/tests.rs",
+                ],
                 &[
                     (
                         "loop runner emits hook-run telemetry after each attempt",
