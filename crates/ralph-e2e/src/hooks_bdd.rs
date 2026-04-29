@@ -1544,7 +1544,7 @@ fn evaluate_ac_08(
             )?;
 
             assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner.rs",
+                "crates/ralph-cli/src/loop_runner/mod.rs",
                 &[
                     (
                         "warn policy maps to warn disposition",
@@ -1609,7 +1609,7 @@ fn evaluate_ac_09(
             )?;
 
             assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner.rs",
+                "crates/ralph-cli/src/loop_runner/mod.rs",
                 &[
                     (
                         "block policy maps to block disposition",
@@ -1816,7 +1816,7 @@ fn evaluate_ac_13(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner.rs",
+                "crates/ralph-cli/src/loop_runner/mod.rs",
                 &[
                     (
                         "mutation parser short-circuits when mutate.enabled is false",
@@ -1870,7 +1870,7 @@ fn evaluate_ac_14(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner.rs",
+                "crates/ralph-cli/src/loop_runner/mod.rs",
                 &[
                     (
                         "mutation payload parser enforces metadata-only top-level schema",
@@ -1928,7 +1928,7 @@ fn evaluate_ac_15(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner.rs",
+                "crates/ralph-cli/src/loop_runner/mod.rs",
                 &[
                     (
                         "mutation parser attempts JSON decode of hook stdout",
@@ -2069,7 +2069,7 @@ fn evaluate_ac_16(
             )?;
 
             assert_workspace_source_contains(
-                "crates/ralph-cli/src/loop_runner.rs",
+                "crates/ralph-cli/src/loop_runner/mod.rs",
                 &[
                     (
                         "loop runner emits hook-run telemetry after each attempt",
