@@ -269,7 +269,7 @@ pub(super) async fn handle_wave_events(
 ///
 /// Creates per-worker event files, spawns workers with concurrency-limited
 /// semaphore, collects results, and returns a `CompletedWave`.
-async fn execute_wave(
+pub(super) async fn execute_wave(
     wave: &ralph_core::DetectedWave,
     global_backend: &CliBackend,
     main_events_file: &Path,
@@ -518,12 +518,12 @@ type WaveWorkerOutcome =
     std::result::Result<(Vec<ralph_core::Event>, Duration, bool), (String, Duration)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaveWorkerExecutionMode {
+pub(super) enum WaveWorkerExecutionMode {
     Pty,
     Acp,
 }
 
-fn wave_worker_execution_mode(output_format: BackendOutputFormat) -> WaveWorkerExecutionMode {
+pub(super) fn wave_worker_execution_mode(output_format: BackendOutputFormat) -> WaveWorkerExecutionMode {
     match output_format {
         BackendOutputFormat::Acp => WaveWorkerExecutionMode::Acp,
         _ => WaveWorkerExecutionMode::Pty,
@@ -642,7 +642,7 @@ enum AcpWaveExecutionResult {
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
-enum MockAcpExecution {
+pub(super) enum MockAcpExecution {
     Success {
         success: bool,
         events: Vec<ralph_core::Event>,
@@ -658,18 +658,18 @@ enum MockAcpExecution {
 
 #[cfg(test)]
 impl MockAcpExecution {
-    fn success(success: bool, events: Vec<ralph_core::Event>) -> Self {
+    pub(super) fn success(success: bool, events: Vec<ralph_core::Event>) -> Self {
         Self::Success { success, events }
     }
 
-    fn error(error: impl Into<String>, events: Vec<ralph_core::Event>) -> Self {
+    pub(super) fn error(error: impl Into<String>, events: Vec<ralph_core::Event>) -> Self {
         Self::Error {
             error: error.into(),
             events,
         }
     }
 
-    fn timeout(events: Vec<ralph_core::Event>) -> Self {
+    pub(super) fn timeout(events: Vec<ralph_core::Event>) -> Self {
         Self::Timeout { events }
     }
 
@@ -715,12 +715,12 @@ impl MockAcpExecution {
 }
 
 #[cfg(test)]
-static MOCK_ACP_EXECUTIONS: std::sync::LazyLock<
+pub(super) static MOCK_ACP_EXECUTIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::VecDeque<MockAcpExecution>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
 
 #[cfg(test)]
-static MOCK_ACP_EXECUTION_SERIAL: std::sync::LazyLock<std::sync::Mutex<()>> =
+pub(super) static MOCK_ACP_EXECUTION_SERIAL: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 async fn execute_wave_worker_acp_prompt(
@@ -765,7 +765,7 @@ async fn execute_wave_worker_acp_prompt(
     }
 }
 
-async fn run_wave_worker_acp(
+pub(super) async fn run_wave_worker_acp(
     index: u32,
     worker_backend: &CliBackend,
     prompt: &str,
@@ -830,7 +830,7 @@ fn forced_test_wave_pty_failure<'a>(worker_backend: &'a CliBackend, key: &str) -
         .find_map(|(name, value)| (name == key).then_some(value.as_str()))
 }
 
-async fn run_wave_worker_pty(
+pub(super) async fn run_wave_worker_pty(
     index: u32,
     worker_backend: &CliBackend,
     prompt: &str,
@@ -1075,7 +1075,7 @@ fn truncate_wave_worker_preview(text: &str) -> String {
 }
 
 /// Extract a human-readable text delta from a single stdout line.
-fn extract_readable_delta(line: &str, output_format: BackendOutputFormat) -> Option<String> {
+pub(super) fn extract_readable_delta(line: &str, output_format: BackendOutputFormat) -> Option<String> {
     match output_format {
         BackendOutputFormat::Text | BackendOutputFormat::Acp => Some(format!("{line}\n")),
         BackendOutputFormat::StreamJson => {
@@ -1172,7 +1172,7 @@ fn read_worker_events(path: &Path) -> Vec<ralph_core::Event> {
 ///
 /// Appends all result events to the main JSONL file so the aggregator hat
 /// picks them up on the next iteration.
-fn merge_wave_results_to_events_file(
+pub(super) fn merge_wave_results_to_events_file(
     completed: &ralph_core::CompletedWave,
     events_file: &Path,
     publish_topics: &[String],

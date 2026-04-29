@@ -47,6 +47,13 @@ use merge_queue::process_pending_merges_with_command;
 
 mod wave;
 use wave::handle_wave_events;
+#[cfg(test)]
+use wave::{
+    MOCK_ACP_EXECUTIONS, MOCK_ACP_EXECUTION_SERIAL, MockAcpExecution,
+    WaveWorkerExecutionMode, execute_wave, extract_readable_delta,
+    merge_wave_results_to_events_file, run_wave_worker_acp, run_wave_worker_pty,
+    wave_worker_execution_mode,
+};
 
 /// Outcome of executing a prompt via PTY or CLI executor.
 pub(crate) struct ExecutionOutcome {
