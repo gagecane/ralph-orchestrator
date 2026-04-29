@@ -2189,12 +2189,16 @@ fn evaluate_ac_17(
             )?;
 
             assert_workspace_source_contains(
+                "crates/ralph-cli/src/cli_parser.rs",
+                &[(
+                    "top-level CLI command enum registers hooks namespace",
+                    "Hooks(hooks::HooksArgs),",
+                )],
+            )?;
+
+            assert_workspace_source_contains(
                 "crates/ralph-cli/src/main.rs",
                 &[
-                    (
-                        "top-level CLI command enum registers hooks namespace",
-                        "Hooks(hooks::HooksArgs),",
-                    ),
                     (
                         "main command dispatcher routes hooks invocations",
                         "Some(Commands::Hooks(args)) => {",
