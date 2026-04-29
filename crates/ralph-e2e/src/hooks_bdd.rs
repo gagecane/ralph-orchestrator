@@ -1059,7 +1059,7 @@ fn evaluate_ac_01(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-core/src/config.rs",
+                "crates/ralph-core/src/config/mod.rs",
                 &[
                     (
                         "RalphConfig carries hooks config at project scope",
@@ -1069,11 +1069,15 @@ fn evaluate_ac_01(
                         "RalphConfig default initializes hooks without global source",
                         "hooks: HooksConfig::default(),",
                     ),
-                    (
-                        "hooks docs explicitly describe per-project scope",
-                        "Controls per-project orchestrator lifecycle hooks.",
-                    ),
                 ],
+            )?;
+
+            assert_workspace_source_contains(
+                "crates/ralph-core/src/config/hooks.rs",
+                &[(
+                    "hooks docs explicitly describe per-project scope",
+                    "Controls per-project orchestrator lifecycle hooks.",
+                )],
             )?;
 
             assert_workspace_source_contains(
@@ -1115,7 +1119,7 @@ fn evaluate_ac_02(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-core/src/config.rs",
+                "crates/ralph-core/src/config/hooks.rs",
                 &[
                     (
                         "pre.loop.start phase-event parses",
@@ -1221,7 +1225,7 @@ fn evaluate_ac_03(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-core/src/config.rs",
+                "crates/ralph-core/src/config/hooks.rs",
                 &[
                     (
                         "pre.loop.start serde key exists",
@@ -1313,7 +1317,7 @@ fn evaluate_ac_04(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-core/src/config.rs",
+                "crates/ralph-core/src/config/hooks.rs",
                 &[(
                     "phase-event hook lists preserve declaration order via Vec",
                     "pub events: HashMap<HookPhaseEvent, Vec<HookSpec>>,",
@@ -1517,7 +1521,7 @@ fn evaluate_ac_08(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-core/src/config.rs",
+                "crates/ralph-core/src/config/hooks.rs",
                 &[
                     (
                         "HookOnError enum exposes warn policy",
@@ -1528,11 +1532,15 @@ fn evaluate_ac_08(
                         "/// Continue orchestration and record warning telemetry.",
                     ),
                     ("warn policy variant exists", "Warn,"),
-                    (
-                        "hook validation requires explicit warn|block|suspend policy",
-                        "is required in v1 (warn | block | suspend)",
-                    ),
                 ],
+            )?;
+
+            assert_workspace_source_contains(
+                "crates/ralph-core/src/config/mod.rs",
+                &[(
+                    "hook validation requires explicit warn|block|suspend policy",
+                    "is required in v1 (warn | block | suspend)",
+                )],
             )?;
 
             assert_workspace_source_contains(
@@ -1578,7 +1586,7 @@ fn evaluate_ac_09(
         validate_acceptance_context,
         |_harness| {
             assert_workspace_source_contains(
-                "crates/ralph-core/src/config.rs",
+                "crates/ralph-core/src/config/hooks.rs",
                 &[
                     (
                         "HookOnError enum exposes block policy",
@@ -1589,11 +1597,15 @@ fn evaluate_ac_09(
                         "/// Stop the current lifecycle action as a failure.",
                     ),
                     ("block policy variant exists", "Block,"),
-                    (
-                        "hook validation requires explicit warn|block|suspend policy",
-                        "is required in v1 (warn | block | suspend)",
-                    ),
                 ],
+            )?;
+
+            assert_workspace_source_contains(
+                "crates/ralph-core/src/config/mod.rs",
+                &[(
+                    "hook validation requires explicit warn|block|suspend policy",
+                    "is required in v1 (warn | block | suspend)",
+                )],
             )?;
 
             assert_workspace_source_contains(
@@ -2622,7 +2634,7 @@ mod tests {
     #[test]
     fn assert_workspace_source_contains_reports_missing_snippets() {
         let error = assert_workspace_source_contains(
-            "crates/ralph-core/src/config.rs",
+            "crates/ralph-core/src/config/mod.rs",
             &[(
                 "nonexistent marker",
                 "__never_present_marker_for_hooks_bdd_test__",
@@ -2631,7 +2643,7 @@ mod tests {
         .expect_err("missing snippet should fail");
 
         assert!(error.contains("source evidence assertion failed"));
-        assert!(error.contains("crates/ralph-core/src/config.rs"));
+        assert!(error.contains("crates/ralph-core/src/config/mod.rs"));
         assert!(error.contains("nonexistent marker"));
         assert!(error.contains("__never_present_marker_for_hooks_bdd_test__"));
     }
@@ -2654,7 +2666,7 @@ mod tests {
             validate_acceptance_context,
             |_harness| {
                 assert_required_source_snippets(
-                    "crates/ralph-core/src/config.rs",
+                    "crates/ralph-core/src/config/mod.rs",
                     "pub hooks: HooksConfig,\n",
                     &[(
                         "hooks defaults preserve project scope",
@@ -2669,7 +2681,9 @@ mod tests {
         assert!(
             result
                 .message
-                .contains("source evidence assertion failed for crates/ralph-core/src/config.rs")
+                .contains(
+                    "source evidence assertion failed for crates/ralph-core/src/config/mod.rs"
+                )
         );
         assert!(
             result
