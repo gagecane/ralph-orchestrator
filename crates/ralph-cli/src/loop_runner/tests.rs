@@ -3477,9 +3477,9 @@ fn test_detect_solo_output_completion_requires_hatless_mode() {
     let yaml = r#"
 hats:
   builder:
-name: "Builder"
-triggers: ["build.start"]
-publishes: ["build.done"]
+    name: "Builder"
+    triggers: ["build.start"]
+    publishes: ["build.done"]
 "#;
     let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
     let registry = HatRegistry::from_config(&config);
@@ -4215,37 +4215,37 @@ import sys
 args = sys.argv[1:]
 prompt = ""
 if "--prompt-file" in args:
-prompt_flag_index = args.index("--prompt-file")
-prompt = pathlib.Path(args[prompt_flag_index + 1]).read_text()
+    prompt_flag_index = args.index("--prompt-file")
+    prompt = pathlib.Path(args[prompt_flag_index + 1]).read_text()
 elif "--print" in args:
-chunks = []
-fd = sys.stdin.fileno()
-while True:
-    ready, _, _ = select.select([fd], [], [], 0.1)
-    if not ready:
-        break
-    chunk = os.read(fd, 4096)
-    if not chunk:
-        break
-    chunks.append(chunk)
-prompt = b"".join(chunks).decode()
+    chunks = []
+    fd = sys.stdin.fileno()
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if not ready:
+            break
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    prompt = b"".join(chunks).decode()
 elif args:
-prompt = args[-1]
-temp_file_prefix = "Please read and execute the task in "
-if prompt.startswith(temp_file_prefix):
-    prompt = pathlib.Path(prompt[len(temp_file_prefix):]).read_text()
+    prompt = args[-1]
+    temp_file_prefix = "Please read and execute the task in "
+    if prompt.startswith(temp_file_prefix):
+        prompt = pathlib.Path(prompt[len(temp_file_prefix):]).read_text()
 
 pathlib.Path(os.environ["RALPH_EVENTS_FILE"] + ".capture").write_text(json.dumps({{
-"args": args,
-"env": {{
-    "RALPH_WAVE_WORKER": os.environ.get("RALPH_WAVE_WORKER", ""),
-    "RALPH_WAVE_ID": os.environ.get("RALPH_WAVE_ID", ""),
-    "RALPH_WAVE_INDEX": os.environ.get("RALPH_WAVE_INDEX", ""),
-    "RALPH_EVENTS_FILE": os.environ.get("RALPH_EVENTS_FILE", ""),
-    "TERM": os.environ.get("TERM", ""),
-    "NO_COLOR": os.environ.get("NO_COLOR", ""),
-}},
-"prompt": prompt,
+    "args": args,
+    "env": {{
+        "RALPH_WAVE_WORKER": os.environ.get("RALPH_WAVE_WORKER", ""),
+        "RALPH_WAVE_ID": os.environ.get("RALPH_WAVE_ID", ""),
+        "RALPH_WAVE_INDEX": os.environ.get("RALPH_WAVE_INDEX", ""),
+        "RALPH_EVENTS_FILE": os.environ.get("RALPH_EVENTS_FILE", ""),
+        "TERM": os.environ.get("TERM", ""),
+        "NO_COLOR": os.environ.get("NO_COLOR", ""),
+    }},
+    "prompt": prompt,
 }}))
 ' "$@"
 cat <<'EOF' > "$RALPH_EVENTS_FILE"
@@ -6702,13 +6702,13 @@ fn test_recover_late_events_before_fallback_routes_pending_work() {
     let yaml = r#"
 hats:
   investigator:
-name: "Investigator"
-triggers: ["debug.start", "hypothesis.rejected", "hypothesis.confirmed", "fix.verified"]
-publishes: ["hypothesis.test", "fix.propose", "DEBUG_COMPLETE"]
+    name: "Investigator"
+    triggers: ["debug.start", "hypothesis.rejected", "hypothesis.confirmed", "fix.verified"]
+    publishes: ["hypothesis.test", "fix.propose", "DEBUG_COMPLETE"]
   tester:
-name: "Tester"
-triggers: ["hypothesis.test"]
-publishes: ["hypothesis.confirmed", "hypothesis.rejected"]
+    name: "Tester"
+    triggers: ["hypothesis.test"]
+    publishes: ["hypothesis.confirmed", "hypothesis.rejected"]
 "#;
     let (mut event_loop, loop_ctx) =
         dispatch_test_event_loop_from_yaml_with_context(temp_dir.path(), yaml);
@@ -6854,11 +6854,11 @@ fn test_resolve_display_hat_for_execution_prefers_prompt_selected_hat_for_ralph(
     let yaml = r#"
 hats:
   investigator:
-name: "Investigator"
-triggers: ["debug.start", "hypothesis.confirmed"]
+    name: "Investigator"
+    triggers: ["debug.start", "hypothesis.confirmed"]
   tester:
-name: "Tester"
-triggers: ["hypothesis.test"]
+    name: "Tester"
+    triggers: ["hypothesis.test"]
 "#;
     let config: RalphConfig = serde_yaml::from_str(yaml).expect("yaml config");
     let mut event_loop = EventLoop::new(config);
@@ -6884,11 +6884,11 @@ fn test_resolve_display_hat_for_execution_ignores_targeted_task_resume_noise() {
     let yaml = r#"
 hats:
   investigator:
-name: "Investigator"
-triggers: ["task.resume", "debug.start", "hypothesis.confirmed"]
+    name: "Investigator"
+    triggers: ["task.resume", "debug.start", "hypothesis.confirmed"]
   tester:
-name: "Tester"
-triggers: ["hypothesis.test"]
+    name: "Tester"
+    triggers: ["hypothesis.test"]
 "#;
     let config: RalphConfig = serde_yaml::from_str(yaml).expect("yaml config");
     let mut event_loop = EventLoop::new(config);
@@ -6917,11 +6917,11 @@ fn test_resolve_display_hat_for_execution_prefers_downstream_event_over_start_ev
     let yaml = r#"
 hats:
   investigator:
-name: "Investigator"
-triggers: ["debug.start", "hypothesis.confirmed"]
+    name: "Investigator"
+    triggers: ["debug.start", "hypothesis.confirmed"]
   tester:
-name: "Tester"
-triggers: ["hypothesis.test"]
+    name: "Tester"
+    triggers: ["hypothesis.test"]
 "#;
     let config: RalphConfig = serde_yaml::from_str(yaml).expect("yaml config");
     let mut event_loop = EventLoop::new(config);
