@@ -15,6 +15,7 @@
 
 mod backend_support;
 mod bot;
+mod cli_parser;
 mod cli_types;
 mod commands;
 mod config_resolution;
