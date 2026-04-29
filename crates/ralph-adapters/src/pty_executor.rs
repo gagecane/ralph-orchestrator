@@ -2585,8 +2585,15 @@ mod tests {
         let large_prompt = "x".repeat(32_000);
 
         // Before the fix, this would hang forever with stdin-mode backends.
+        // The timeout is deliberately generous: this test runs end-to-end
+        // through PTY allocation, process spawn, echo execution, and a 2s
+        // wait-for-exit grace period. Under parallel workspace load the host
+        // can take several seconds to schedule these steps. The assertion we
+        // care about is "does not hang forever", not "completes quickly", so
+        // a 60s ceiling still catches a real deadlock while tolerating slow
+        // CI/refinery hosts. See ro-d8rt.
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60),
             executor.run_observe(&large_prompt, rx),
         )
         .await
