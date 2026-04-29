@@ -24,6 +24,8 @@ export function initializeTestDatabase(): void {
   testDb = drizzle(testSqlite, { schema });
 
   // Create required tables
+  // Schema must mirror src/db/schema.ts so repository code that selects/inserts
+  // every schema column works against the in-memory test database.
   testSqlite.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
@@ -40,7 +42,12 @@ export function initializeTestDatabase(): void {
       execution_summary TEXT,
       exit_code INTEGER,
       duration_ms INTEGER,
-      archived_at INTEGER
+      archived_at INTEGER,
+      merge_loop_prompt TEXT,
+      preset TEXT,
+      current_iteration INTEGER,
+      max_iterations INTEGER,
+      loop_id TEXT
     )
   `);
 
