@@ -108,11 +108,6 @@ const taskBridge = new TaskBridge(taskRepository, taskQueue, eventBus, {
   configMerger,
 });
 
-// Make queue available globally for backward compatibility
-// TODO: Remove when all code uses TaskBridge
-(globalThis as Record<string, unknown>).__taskQueue = taskQueue;
-(globalThis as Record<string, unknown>).__dispatcher = dispatcher;
-
 // Create LoopsManager for periodic merge queue processing
 // This handles git merge conflicts when multiple worktree loops complete in parallel
 const loopsManager = new LoopsManager({
