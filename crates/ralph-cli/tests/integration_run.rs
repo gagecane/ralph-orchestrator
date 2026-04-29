@@ -1,9 +1,24 @@
 use std::process::Command;
 use tempfile::TempDir;
 
+/// Environment variables that can leak developer settings into tests and
+/// must be cleared for test hermeticity. `RALPH_CONFIG` is the main culprit —
+/// when set in a developer's shell, it points `default_config_path()` at the
+/// developer's personal config, which then overrides the test's user-scoped
+/// and workspace-local configs. `RALPH_WORKSPACE_ROOT` similarly redirects
+/// config discovery away from the test's tempdir.
+const LEAKY_ENV_VARS: &[&str] = &["RALPH_CONFIG", "RALPH_WORKSPACE_ROOT"];
+
+fn strip_leaky_env(cmd: &mut Command) {
+    for var in LEAKY_ENV_VARS {
+        cmd.env_remove(var);
+    }
+}
+
 fn run_ralph(temp_path: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ralph"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ralph"));
+    strip_leaky_env(&mut cmd);
+    cmd.args(args)
         .current_dir(temp_path)
         .output()
         .expect("execute ralph")
@@ -14,8 +29,9 @@ fn run_ralph_with_home(
     home_path: &std::path::Path,
     args: &[&str],
 ) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ralph"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ralph"));
+    strip_leaky_env(&mut cmd);
+    cmd.args(args)
         .current_dir(temp_path)
         .env("HOME", home_path)
         .env("USERPROFILE", home_path)
