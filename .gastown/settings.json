@@ -1,0 +1,12 @@
+{
+  "type": "rig-settings",
+  "version": 1,
+  "merge_queue": {
+    "enabled": true,
+    "run_tests": true,
+    "build_command": "cargo build",
+    "test_command": "cargo test --workspace --lib --bins -- --test-threads=1",
+    "lint_command": "cargo clippy",
+    "judgment_enabled": true
+  }
+}
