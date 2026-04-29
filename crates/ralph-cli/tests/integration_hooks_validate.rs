@@ -6,9 +6,24 @@ use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
+/// Environment variables that can leak developer settings into tests and
+/// must be cleared for test hermeticity. `RALPH_CONFIG` is the main culprit —
+/// when set in a developer's shell, it points `default_config_path()` at the
+/// developer's personal config, which then overrides the test's user-scoped
+/// and workspace-local configs. `RALPH_WORKSPACE_ROOT` similarly redirects
+/// config discovery away from the test's tempdir.
+const LEAKY_ENV_VARS: &[&str] = &["RALPH_CONFIG", "RALPH_WORKSPACE_ROOT"];
+
+fn strip_leaky_env(cmd: &mut Command) {
+    for var in LEAKY_ENV_VARS {
+        cmd.env_remove(var);
+    }
+}
+
 fn ralph_hooks_validate(temp_path: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ralph"))
-        .args(["--color", "never"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ralph"));
+    strip_leaky_env(&mut cmd);
+    cmd.args(["--color", "never"])
         .args(args)
         .current_dir(temp_path)
         .env("NO_COLOR", "1")
@@ -17,8 +32,9 @@ fn ralph_hooks_validate(temp_path: &Path, args: &[&str]) -> Output {
 }
 
 fn ralph_hooks_validate_with_home(temp_path: &Path, home_path: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ralph"))
-        .args(["--color", "never"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ralph"));
+    strip_leaky_env(&mut cmd);
+    cmd.args(["--color", "never"])
         .args(args)
         .current_dir(temp_path)
         .env("HOME", home_path)
