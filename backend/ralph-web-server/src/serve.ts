@@ -115,9 +115,6 @@ const loopsManager = new LoopsManager({
   workspaceRoot: CWD,
 });
 
-// Make LoopsManager available globally for potential API access
-(globalThis as Record<string, unknown>).__loopsManager = loopsManager;
-
 // Create PlanningService for planning session management
 // Use REPO_ROOT for PlanningService because the planning preset (planning.yml)
 // is located at presets/ relative to the monorepo root,
@@ -127,9 +124,6 @@ const planningService = new PlanningService({
   ralphPath: "ralph",
   defaultTimeoutSeconds: 300,
 });
-
-// Make PlanningService available globally
-(globalThis as Record<string, unknown>).__planningService = planningService;
 
 // Graceful shutdown handler
 let isShuttingDown = false;
