@@ -15,6 +15,7 @@
 
 mod backend_support;
 mod bot;
+mod cli_types;
 mod commands;
 mod config_resolution;
 mod display;
@@ -38,9 +39,10 @@ mod test_support;
 mod tools;
 mod wave;
 mod web;
+mod workspace;
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand};
 use ralph_adapters::detect_backend;
 use ralph_core::{
     CheckStatus, LockError, LoopContext, LoopEntry, LoopLock, LoopRegistry,
@@ -48,8 +50,8 @@ use ralph_core::{
     truncate_with_ellipsis,
     worktree::{WorktreeConfig, create_worktree, ensure_gitignore, remove_worktree},
 };
-use std::io::{IsTerminal, stdout};
-use std::path::{Path, PathBuf};
+use std::io::IsTerminal;
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 // Unix-specific process management for process group leadership
@@ -144,156 +146,18 @@ fn install_panic_hook() {
 }
 
 /// Color output mode for terminal display.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub enum ColorMode {
-    /// Automatically detect if stdout is a TTY
-    #[default]
-    Auto,
-    /// Always use colors
-    Always,
-    /// Never use colors
-    Never,
-}
+pub use cli_types::ColorMode;
 
-impl ColorMode {
-    /// Returns true if colors should be used based on mode and terminal detection.
-    fn should_use_colors(self) -> bool {
-        // NO_COLOR is a de-facto cross-tooling convention and should disable ANSI
-        // colors by default, regardless of output mode.
-        if std::env::var("NO_COLOR").is_ok() {
-            return false;
-        }
-
-        match self {
-            ColorMode::Always => true,
-            ColorMode::Never => false,
-            ColorMode::Auto => stdout().is_terminal(),
-        }
-    }
-}
-
-/// Returns the default config source path.
-///
-/// `RALPH_CONFIG` (if set) is used before the hardcoded fallback to `ralph.yml`.
-pub(crate) fn default_config_path() -> PathBuf {
-    if let Ok(value) = std::env::var("RALPH_CONFIG")
-        && !value.trim().is_empty()
-    {
-        return PathBuf::from(value);
-    }
-
-    PathBuf::from("ralph.yml")
-}
-
-pub(crate) fn resolve_workspace_root(root: Option<&PathBuf>) -> PathBuf {
-    if let Some(root) = root {
-        return root.clone();
-    }
-
-    if let Ok(value) = std::env::var("RALPH_WORKSPACE_ROOT")
-        && !value.trim().is_empty()
-    {
-        return PathBuf::from(value);
-    }
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    discover_workspace_root(&cwd).unwrap_or(cwd)
-}
-
-pub(crate) fn resolve_path_from_workspace(
-    path: impl AsRef<Path>,
-    root: Option<&PathBuf>,
-) -> PathBuf {
-    resolve_workspace_root(root).join(path)
-}
-
-pub(crate) fn urgent_steer_path_from_workspace(root: Option<&PathBuf>) -> PathBuf {
-    resolve_workspace_root(root).join(".ralph/urgent-steer.json")
-}
-
-pub(crate) fn discover_workspace_root(start: &Path) -> Option<PathBuf> {
-    start.ancestors().find_map(|dir| {
-        let has_ralph = dir.join(".ralph").is_dir();
-        let has_git = dir.join(".git").exists();
-        if has_ralph || has_git {
-            Some(dir.to_path_buf())
-        } else {
-            None
-        }
-    })
-}
-
-pub(crate) fn resolve_marker_target(workspace_root: &Path, marker_value: &str) -> PathBuf {
-    let path = PathBuf::from(marker_value.trim());
-    if path.is_absolute() {
-        path
-    } else {
-        workspace_root.join(path)
-    }
-}
+pub(crate) use workspace::{
+    default_config_path, resolve_marker_target, resolve_path_from_workspace,
+    resolve_workspace_root, urgent_steer_path_from_workspace,
+};
 
 /// Verbosity level for streaming output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Verbosity {
-    /// Suppress all streaming output (for CI/scripting)
-    Quiet,
-    /// Show assistant text and tool invocations (default)
-    #[default]
-    Normal,
-    /// Show everything including tool results and session summary
-    Verbose,
-}
-
-impl Verbosity {
-    /// Resolves verbosity from CLI args, env vars, and config.
-    ///
-    /// Precedence (highest to lowest):
-    /// 1. CLI flags: `--verbose`/`-v` or `--quiet`/`-q`
-    /// 2. Environment variables: `RALPH_VERBOSE=1` or `RALPH_QUIET=1`
-    /// 3. Config file: (if supported in future)
-    /// 4. Default: Normal
-    fn resolve(cli_verbose: bool, cli_quiet: bool) -> Self {
-        let env_quiet = std::env::var("RALPH_QUIET").is_ok();
-        let env_verbose = std::env::var("RALPH_VERBOSE").is_ok();
-        Self::resolve_with_env(cli_verbose, cli_quiet, env_quiet, env_verbose)
-    }
-
-    #[allow(clippy::fn_params_excessive_bools)]
-    fn resolve_with_env(
-        cli_verbose: bool,
-        cli_quiet: bool,
-        env_quiet: bool,
-        env_verbose: bool,
-    ) -> Self {
-        // CLI flags take precedence
-        if cli_quiet {
-            return Verbosity::Quiet;
-        }
-        if cli_verbose {
-            return Verbosity::Verbose;
-        }
-
-        // Environment variables
-        if env_quiet {
-            return Verbosity::Quiet;
-        }
-        if env_verbose {
-            return Verbosity::Verbose;
-        }
-
-        Verbosity::Normal
-    }
-}
+pub use cli_types::Verbosity;
 
 /// Output format for events command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub enum OutputFormat {
-    /// Human-readable table format
-    #[default]
-    Table,
-    /// JSON format for programmatic access
-    Json,
-}
+pub use cli_types::OutputFormat;
 
 // Re-export colors and truncate from display module for use in this file
 use display::colors;
@@ -2045,45 +1909,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verbosity_cli_quiet() {
-        assert_eq!(Verbosity::resolve(false, true), Verbosity::Quiet);
-    }
-
-    #[test]
-    fn test_verbosity_cli_verbose() {
-        assert_eq!(Verbosity::resolve(true, false), Verbosity::Verbose);
-    }
-
-    #[test]
-    fn test_verbosity_default() {
-        assert_eq!(Verbosity::resolve(false, false), Verbosity::Normal);
-    }
-
-    #[test]
-    fn test_verbosity_env_quiet() {
-        assert_eq!(
-            Verbosity::resolve_with_env(false, false, true, false),
-            Verbosity::Quiet
-        );
-    }
-
-    #[test]
-    fn test_verbosity_env_verbose() {
-        assert_eq!(
-            Verbosity::resolve_with_env(false, false, false, true),
-            Verbosity::Verbose
-        );
-    }
-
-    #[test]
-    fn test_color_mode_should_use_colors() {
-        // `NO_COLOR` disables ANSI globally, including `--color always`.
-        let expected_always = std::env::var("NO_COLOR").is_err();
-        assert_eq!(ColorMode::Always.should_use_colors(), expected_always);
-        assert!(!ColorMode::Never.should_use_colors());
-    }
-
-    #[test]
     fn test_config_source_parse_builtin() {
         let source = ConfigSource::parse("builtin:code-assist");
         match source {
@@ -2251,19 +2076,6 @@ mod tests {
             }
             other => panic!("unexpected CLI parse result: {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_resolve_workspace_root_discovers_ancestor_ralph_dir() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        std::fs::create_dir_all(temp_dir.path().join(".ralph")).expect("ralph dir");
-        let nested = temp_dir.path().join("a/b/c");
-        std::fs::create_dir_all(&nested).expect("nested dir");
-
-        assert_eq!(
-            discover_workspace_root(&nested),
-            Some(temp_dir.path().to_path_buf())
-        );
     }
 
     #[test]
