@@ -25,31 +25,34 @@
  * - `TaskBridge.helpers.ts`       — `getGitRepoRoot`, `extractSummaryFromOutput`
  * - `TaskBridge.configResolver.ts` — preset/config → `-c <path>` CLI args
  * - `TaskBridge.loopResolver.ts`  — loop ID lookup + post-start polling helper
- * - `TaskBridge.eventHandlers.ts` — EventBus → DB lifecycle handlers
- * - `TaskBridge.lifecycle.ts`     — recover / reconnect / cancel helpers
  */
 
+import * as fs from "fs";
+import * as path from "path";
+import stripAnsi from "strip-ansi";
 import { TaskRepository } from "../repositories";
 import { ProcessSupervisor } from "../runner/ProcessSupervisor";
 import { FileOutputStreamer } from "../runner/FileOutputStreamer";
 import { CollectionService } from "./CollectionService";
 import { ConfigMerger } from "./ConfigMerger";
 import { TaskQueueService } from "../queue/TaskQueueService";
-import { EventBus, Subscription } from "../queue/EventBus";
+import { EventBus, Event, Subscription } from "../queue/EventBus";
 import { Task } from "../db/schema";
 
+import { getGitRepoRoot, extractSummaryFromOutput } from "./TaskBridge.helpers";
 import { resolveConfigArgs } from "./TaskBridge.configResolver";
-import { scheduleLoopIdResolution } from "./TaskBridge.loopResolver";
-import { subscribeLifecycleEvents } from "./TaskBridge.eventHandlers";
 import {
-  cancelTask as cancelTaskImpl,
-  recoverStuckTasks as recoverStuckTasksImpl,
-  reconnectRunningTasks as reconnectRunningTasksImpl,
-} from "./TaskBridge.lifecycle";
+  resolveLoopId,
+  scheduleLoopIdResolution,
+} from "./TaskBridge.loopResolver";
 import type {
   EnqueueAllResult,
   EnqueueResult,
   ExecutionStatus,
+  TaskCompletedPayload,
+  TaskFailedPayload,
+  TaskStartedPayload,
+  TaskTimeoutPayload,
 } from "./TaskBridge.types";
 
 // Re-export public types so existing `from "./TaskBridge"` imports keep working.
@@ -120,15 +123,167 @@ export class TaskBridge {
     this.configMerger = options.configMerger;
 
     // Subscribe to execution lifecycle events
+    this.subscribeToEvents();
+  }
+
+  /**
+   * Subscribe to EventBus events for task lifecycle updates
+   */
+  private subscribeToEvents(): void {
     this.subscriptions.push(
-      ...subscribeLifecycleEvents(this.eventBus, {
-        taskRepository: this.taskRepository,
-        taskIdMap: this.taskIdMap,
-        defaultCwd: this.defaultCwd,
-        scheduleLoopIdResolution: (dbTaskId) =>
-          this.scheduleLoopIdResolution(dbTaskId),
+      this.eventBus.subscribe<TaskStartedPayload>("task.started", (event) => {
+        this.handleTaskStarted(event);
       })
     );
+    this.subscriptions.push(
+      this.eventBus.subscribe<TaskCompletedPayload>("task.completed", (event) => {
+        this.handleTaskCompleted(event);
+      })
+    );
+    this.subscriptions.push(
+      this.eventBus.subscribe<TaskFailedPayload>("task.failed", (event) => {
+        this.handleTaskFailed(event);
+      })
+    );
+    this.subscriptions.push(
+      this.eventBus.subscribe<TaskTimeoutPayload>("task.timeout", (event) => {
+        this.handleTaskTimeout(event);
+      })
+    );
+  }
+
+  /**
+   * Handle task.started event - update DB task to 'running'
+   */
+  private handleTaskStarted(event: Event<TaskStartedPayload>): void {
+    const { taskId: queuedTaskId } = event.payload;
+    const dbTaskId = this.taskIdMap.get(queuedTaskId);
+
+    if (!dbTaskId) {
+      // Task was not enqueued via TaskBridge (possibly a direct queue addition)
+      return;
+    }
+
+    this.taskRepository.update(dbTaskId, {
+      status: "running",
+      startedAt: new Date(),
+    });
+
+    // Start polling for loop ID in the background
+    this.scheduleLoopIdResolution(dbTaskId);
+  }
+
+  /**
+   * Handle task.completed event - update DB task to 'closed'
+   * Reads execution summary from .agent/scratchpad.md (preferred) or .agent/summary.md (fallback).
+   * The scratchpad contains the internal monologue which is more informative for UX.
+   */
+  private handleTaskCompleted(event: Event<TaskCompletedPayload>): void {
+    const { taskId: queuedTaskId, durationMs, result } = event.payload;
+    const dbTaskId = this.taskIdMap.get(queuedTaskId);
+
+    if (!dbTaskId) {
+      return;
+    }
+
+    let executionSummary: string | null = null;
+
+    // Try to read from .agent/scratchpad.md first (internal monologue - better UX)
+    const repoRoot = getGitRepoRoot(this.defaultCwd);
+    const scratchpadPath = path.join(repoRoot, ".agent", "scratchpad.md");
+    const summaryPath = path.join(repoRoot, ".agent", "summary.md");
+
+    try {
+      if (fs.existsSync(scratchpadPath)) {
+        executionSummary = fs.readFileSync(scratchpadPath, "utf-8");
+      }
+    } catch (err) {
+      console.warn(`Could not read scratchpad: ${err}`);
+    }
+
+    // Fallback to .agent/summary.md if no scratchpad
+    if (!executionSummary) {
+      try {
+        if (fs.existsSync(summaryPath)) {
+          executionSummary = fs.readFileSync(summaryPath, "utf-8");
+        }
+      } catch (err) {
+        console.warn(`Could not read execution summary: ${err}`);
+      }
+    }
+
+    // Final fallback: extract from stdout (least informative)
+    if (!executionSummary) {
+      executionSummary = extractSummaryFromOutput(result);
+    }
+
+    // Strip ANSI codes if summary exists
+    if (executionSummary) {
+      executionSummary = stripAnsi(executionSummary);
+    }
+
+    // Attempt loop ID resolution as a fallback (in case polling didn't find it yet)
+    const dbTask = this.taskRepository.findById(dbTaskId);
+    let loopId: string | null = null;
+    if (dbTask && !dbTask.loopId) {
+      loopId = resolveLoopId(this.defaultCwd, dbTask.title);
+    }
+
+    this.taskRepository.update(dbTaskId, {
+      status: "closed",
+      completedAt: new Date(),
+      executionSummary,
+      exitCode: result.exitCode ?? 0,
+      durationMs,
+      ...(loopId ? { loopId } : {}),
+    });
+
+    // Clean up the mapping
+    this.taskIdMap.delete(queuedTaskId);
+  }
+
+  /**
+   * Handle task.failed event - update DB task to 'failed'
+   */
+  private handleTaskFailed(event: Event<TaskFailedPayload>): void {
+    const { taskId: queuedTaskId, error, durationMs } = event.payload;
+    const dbTaskId = this.taskIdMap.get(queuedTaskId);
+
+    if (!dbTaskId) {
+      return;
+    }
+
+    this.taskRepository.update(dbTaskId, {
+      status: "failed",
+      completedAt: new Date(),
+      errorMessage: error,
+      exitCode: 1, // Non-zero indicates failure
+      durationMs,
+    });
+
+    this.taskIdMap.delete(queuedTaskId);
+  }
+
+  /**
+   * Handle task.timeout event - update DB task to 'failed' with timeout message
+   */
+  private handleTaskTimeout(event: Event<TaskTimeoutPayload>): void {
+    const { taskId: queuedTaskId, timeoutMs, durationMs } = event.payload;
+    const dbTaskId = this.taskIdMap.get(queuedTaskId);
+
+    if (!dbTaskId) {
+      return;
+    }
+
+    this.taskRepository.update(dbTaskId, {
+      status: "failed",
+      completedAt: new Date(),
+      errorMessage: `Task timed out after ${timeoutMs}ms`,
+      exitCode: 124, // Standard timeout exit code
+      durationMs,
+    });
+
+    this.taskIdMap.delete(queuedTaskId);
   }
 
   /**
@@ -276,7 +431,20 @@ export class TaskBridge {
    * Stuck tasks are marked as failed.
    */
   recoverStuckTasks(): number {
-    return recoverStuckTasksImpl(this.taskRepository);
+    const runningTasks = this.taskRepository.findAll("running");
+    let recoveredCount = 0;
+
+    for (const task of runningTasks) {
+      this.taskRepository.update(task.id, {
+        status: "failed",
+        completedAt: new Date(),
+        errorMessage: "Execution interrupted: Server restarted",
+        exitCode: 1,
+      });
+      recoveredCount++;
+    }
+
+    return recoveredCount;
   }
 
   /**
@@ -286,32 +454,118 @@ export class TaskBridge {
    */
   reconnectRunningTasks(): { reconnected: number; failed: number } {
     if (!this.processSupervisor || !this.outputStreamer) {
-      console.warn(
-        "ProcessSupervisor or FileOutputStreamer not available, skipping reconnection"
-      );
+      console.warn("ProcessSupervisor or FileOutputStreamer not available, skipping reconnection");
       return { reconnected: 0, failed: 0 };
     }
 
-    return reconnectRunningTasksImpl({
-      taskRepository: this.taskRepository,
-      processSupervisor: this.processSupervisor,
-      outputStreamer: this.outputStreamer,
-      eventBus: this.eventBus,
-    });
+    const runningTasks = this.taskRepository.findAll("running");
+    let reconnectedCount = 0;
+    let failedCount = 0;
+
+    for (const task of runningTasks) {
+      try {
+        const handle = this.processSupervisor.reconnect(task.id);
+
+        if (handle && handle.isAlive) {
+          console.log(`Reconnected to task ${task.id} (PID ${handle.pid})`);
+
+          // Resume output streaming
+          this.outputStreamer.stream(task.id, handle.taskDir, (line, source) => {
+            this.eventBus.publish("task.output", {
+              taskId: task.id,
+              line,
+              source,
+            });
+          });
+
+          reconnectedCount++;
+        } else {
+          // Process is dead, mark task as failed
+          const status = this.processSupervisor.getStatus(task.id);
+          const error = status?.error || "Process died during server restart";
+
+          this.taskRepository.update(task.id, {
+            status: "failed",
+            completedAt: new Date(),
+            errorMessage: error,
+            exitCode: status?.exitCode ?? 1,
+          });
+
+          console.log(`Task ${task.id} process died, marked as failed`);
+          failedCount++;
+        }
+      } catch (err) {
+        // Handle corrupted state (AC-5.5)
+        console.warn(`Failed to reconnect task ${task.id}:`, err);
+        this.taskRepository.update(task.id, {
+          status: "failed",
+          completedAt: new Date(),
+          errorMessage: "Corrupted task state",
+          exitCode: 1,
+        });
+        failedCount++;
+      }
+    }
+
+    return { reconnected: reconnectedCount, failed: failedCount };
   }
 
   /**
    * Cancel a running task by stopping the underlying process.
    */
   cancelTask(dbTaskId: string): EnqueueResult {
-    return cancelTaskImpl(
-      {
-        taskRepository: this.taskRepository,
-        processSupervisor: this.processSupervisor,
-        taskIdMap: this.taskIdMap,
-      },
-      dbTaskId
-    );
+    const dbTask = this.taskRepository.findById(dbTaskId);
+
+    if (!dbTask) {
+      return { success: false, error: "Task not found" };
+    }
+
+    if (dbTask.status !== "running") {
+      return { success: false, error: "Only running tasks can be cancelled" };
+    }
+
+    if (!this.processSupervisor) {
+      return { success: false, error: "Process supervisor not available" };
+    }
+
+    // Stop the process
+    const stopResult = this.processSupervisor.stop(dbTaskId);
+
+    if (!stopResult.success) {
+      // Special case: process already terminated means the task ended unexpectedly
+      // We should update the status to reflect reality and return success
+      if (stopResult.error === "Process already terminated") {
+        console.warn(`[TaskBridge] Task ${dbTaskId}: Process already terminated, marking as failed`);
+        this.taskRepository.update(dbTaskId, {
+          status: "failed",
+          completedAt: new Date(),
+          errorMessage: "Process terminated unexpectedly",
+          exitCode: -1,
+        });
+
+        if (dbTask.queuedTaskId) {
+          this.taskIdMap.delete(dbTask.queuedTaskId);
+        }
+
+        return { success: true };
+      }
+
+      return { success: false, error: stopResult.error || "Failed to stop process" };
+    }
+
+    // Update task status to failed with cancellation message
+    this.taskRepository.update(dbTaskId, {
+      status: "failed",
+      completedAt: new Date(),
+      errorMessage: `Task cancelled by user (signal: ${stopResult.signal})`,
+      exitCode: 143, // Standard exit code for SIGTERM (128 + 15)
+    });
+
+    if (dbTask.queuedTaskId) {
+      this.taskIdMap.delete(dbTask.queuedTaskId);
+    }
+
+    return { success: true };
   }
 
   /**
