@@ -15,33 +15,99 @@
  * Lifecycle:
  *   dispatcher.start() → polling loop begins
  *   dispatcher.stop()  → graceful shutdown, waits for running tasks
- *
- * Per-task execution (handler invocation, timeout, cancellation, state
- * transitions, event publication) is delegated to TaskExecutor so this
- * class can focus on orchestration.
  */
 
 import { TaskQueueService, QueuedTask } from "./TaskQueueService";
-import { EventBus } from "./EventBus";
+import { EventBus, Event } from "./EventBus";
 import { TaskState } from "./TaskState";
-import { TaskExecutor } from "./TaskExecutor";
-import {
-  TaskHandler,
-  TaskExecutionResult,
-  DispatcherOptions,
-  DispatcherStats,
-  ExecutorCounters,
-} from "./DispatcherTypes";
 
-// Re-export types from the types module so existing imports keep working.
-export type {
-  TaskHandler,
-  TaskExecutionContext,
-  TaskExecutionResult,
-  DispatcherOptions,
-  DispatcherEventType,
-  DispatcherStats,
-} from "./DispatcherTypes";
+/**
+ * Handler function for executing a specific task type.
+ * Receives the task and returns a result or throws an error.
+ */
+export type TaskHandler<TPayload = Record<string, unknown>, TResult = unknown> = (
+  task: QueuedTask,
+  context: TaskExecutionContext
+) => Promise<TResult> | TResult;
+
+/**
+ * Context provided to task handlers during execution
+ */
+export interface TaskExecutionContext {
+  /** EventBus for publishing events during execution */
+  eventBus: EventBus;
+  /** Correlation ID for tracing */
+  correlationId: string;
+  /** Signal that can be checked for cancellation */
+  signal: AbortSignal;
+}
+
+/**
+ * Result of a task execution
+ */
+export interface TaskExecutionResult {
+  /** The executed task */
+  task: QueuedTask;
+  /** Whether execution succeeded */
+  success: boolean;
+  /** Result returned by the handler (if successful) */
+  result?: unknown;
+  /** Error message (if failed) */
+  error?: string;
+  /** Execution duration in milliseconds */
+  durationMs: number;
+}
+
+/**
+ * Dispatcher configuration options
+ */
+export interface DispatcherOptions {
+  /** Polling interval in milliseconds (default: 100ms) */
+  pollIntervalMs?: number;
+  /** Maximum concurrent tasks (default: 1 for sequential execution) */
+  maxConcurrent?: number;
+  /** Task timeout in milliseconds (default: 30000ms = 30s) */
+  taskTimeoutMs?: number;
+  /** Whether to auto-start on construction (default: false) */
+  autoStart?: boolean;
+}
+
+/**
+ * Event types published by the Dispatcher
+ */
+export type DispatcherEventType =
+  | "dispatcher.started"
+  | "dispatcher.stopped"
+  | "dispatcher.idle"
+  | "task.started"
+  | "task.completed"
+  | "task.failed"
+  | "task.cancelled"
+  | "task.timeout";
+
+/**
+ * Dispatcher statistics
+ */
+export interface DispatcherStats {
+  /** Whether the dispatcher is running */
+  isRunning: boolean;
+  /** Total tasks processed */
+  totalProcessed: number;
+  /** Tasks that completed successfully */
+  successCount: number;
+  /** Tasks that failed */
+  failureCount: number;
+  /** Tasks that were cancelled */
+  cancelledCount: number;
+  /** Currently running tasks */
+  runningCount: number;
+  /** Tasks that timed out */
+  timeoutCount: number;
+  /** Average execution time in ms */
+  avgDurationMs: number;
+  /** Uptime in milliseconds */
+  uptimeMs: number;
+}
 
 /**
  * Dispatcher
@@ -70,8 +136,8 @@ export class Dispatcher {
   private readonly runningTasks: Map<string, AbortController> = new Map();
   private startedAt?: Date;
 
-  /** Statistics (mutable counters shared with TaskExecutor). */
-  private readonly counters: ExecutorCounters = {
+  /** Statistics */
+  private stats = {
     totalProcessed: 0,
     successCount: 0,
     failureCount: 0,
@@ -79,9 +145,6 @@ export class Dispatcher {
     timeoutCount: 0,
     totalDurationMs: 0,
   };
-
-  /** Per-task executor (handler invocation, timeout, cancellation, events). */
-  private readonly executor: TaskExecutor;
 
   /**
    * Create a new Dispatcher
@@ -96,15 +159,6 @@ export class Dispatcher {
     this.pollIntervalMs = options.pollIntervalMs ?? 100;
     this.maxConcurrent = options.maxConcurrent ?? 1;
     this.taskTimeoutMs = options.taskTimeoutMs ?? 7200000;
-
-    this.executor = new TaskExecutor({
-      queue: this.queue,
-      eventBus: this.eventBus,
-      taskTimeoutMs: this.taskTimeoutMs,
-      getHandler: (taskType) => this.getHandler(taskType),
-      counters: this.counters,
-      runningTasks: this.runningTasks,
-    });
 
     if (options.autoStart) {
       this.start();
@@ -178,7 +232,7 @@ export class Dispatcher {
     const task = this.queue.getTask(taskId);
     if (task && task.state === TaskState.PENDING) {
       this.queue.cancel(taskId);
-      this.counters.cancelledCount++;
+      this.stats.cancelledCount++;
 
       await this.eventBus.publish("task.cancelled", {
         taskId,
@@ -292,9 +346,9 @@ export class Dispatcher {
 
         if (task) {
           // Execute the task asynchronously
-          this.executor.execute(task).catch((error) => {
-            // This shouldn't happen as executor.execute handles its own errors
-            console.error("Unexpected error in executor.execute:", error);
+          this.executeTask(task).catch((error) => {
+            // This shouldn't happen as executeTask handles its own errors
+            console.error("Unexpected error in executeTask:", error);
           });
           tasksStarted++;
         } else {
@@ -316,6 +370,208 @@ export class Dispatcher {
   }
 
   /**
+   * Execute a single task.
+   * Handles timeouts, errors, and state transitions.
+   */
+  private async executeTask(task: QueuedTask): Promise<TaskExecutionResult> {
+    const startTime = Date.now();
+    const correlationId = `exec-${task.id}-${startTime}`;
+
+    // Create abort controller for this task
+    const abortController = new AbortController();
+    this.runningTasks.set(task.id, abortController);
+
+    // Create execution context
+    const context: TaskExecutionContext = {
+      eventBus: this.eventBus,
+      correlationId,
+      signal: abortController.signal,
+    };
+
+    // Publish task started event
+    await this.eventBus.publish(
+      "task.started",
+      {
+        taskId: task.id,
+        taskType: task.taskType,
+        payload: task.payload,
+        priority: task.priority,
+      },
+      { correlationId }
+    );
+
+    // Get the handler
+    const handler = this.getHandler(task.taskType);
+
+    let result: TaskExecutionResult;
+
+    if (!handler) {
+      // No handler registered for this task type
+      const errorMsg = `No handler registered for task type: ${task.taskType}`;
+      this.queue.fail(task.id, errorMsg);
+
+      result = {
+        task: this.queue.getTask(task.id) ?? task,
+        success: false,
+        error: errorMsg,
+        durationMs: Date.now() - startTime,
+      };
+
+      // Publish failure event
+      await this.eventBus.publish(
+        "task.failed",
+        {
+          taskId: task.id,
+          taskType: task.taskType,
+          error: errorMsg,
+          durationMs: result.durationMs,
+        },
+        { correlationId }
+      );
+    } else {
+      // Set up timeout
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const timeoutError = new Error(`Task timeout after ${this.taskTimeoutMs}ms`);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          // Pass the timeout error as the abort reason so cancellation promise
+          // won't race ahead with a generic "aborted" message
+          abortController.abort(timeoutError);
+          reject(timeoutError);
+        }, this.taskTimeoutMs);
+      });
+
+      // Set up cancellation monitoring
+      const cancellationPromise = new Promise<never>((_, reject) => {
+        if (abortController.signal.aborted) {
+          reject(abortController.signal.reason || new Error("Task cancelled"));
+        } else {
+          abortController.signal.addEventListener("abort", () => {
+            reject(abortController.signal.reason || new Error("Task cancelled"));
+          });
+        }
+      });
+
+      try {
+        // Execute handler with timeout and cancellation
+        const handlerResult = await Promise.race([
+          Promise.resolve(handler(task, context)),
+          timeoutPromise,
+          cancellationPromise,
+        ]);
+
+        // Clear timeout
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+
+        // Mark as completed
+        this.queue.complete(task.id);
+
+        result = {
+          task: this.queue.getTask(task.id) ?? task,
+          success: true,
+          result: handlerResult,
+          durationMs: Date.now() - startTime,
+        };
+
+        // Publish success event
+        await this.eventBus.publish(
+          "task.completed",
+          {
+            taskId: task.id,
+            taskType: task.taskType,
+            result: handlerResult,
+            durationMs: result.durationMs,
+          },
+          { correlationId }
+        );
+
+        this.stats.successCount++;
+      } catch (error) {
+        // Clear timeout
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        const isTimeout = errorMsg.includes("Task timeout");
+        // Check for cancellation (passed as string "cancelled" or AbortError)
+        const isCancelled =
+          error === "cancelled" ||
+          (error instanceof Error && error.name === "AbortError") ||
+          abortController.signal.aborted;
+
+        result = {
+          task: this.queue.getTask(task.id) ?? task,
+          success: false,
+          error: errorMsg,
+          durationMs: Date.now() - startTime,
+        };
+
+        if (isTimeout) {
+          // Check timeout FIRST - the timeout handler aborts the controller,
+          // so we'd otherwise incorrectly detect this as a cancellation
+          // Mark as failed (timeout)
+          this.queue.fail(task.id, errorMsg);
+
+          await this.eventBus.publish(
+            "task.timeout",
+            {
+              taskId: task.id,
+              taskType: task.taskType,
+              timeoutMs: this.taskTimeoutMs,
+              durationMs: result.durationMs,
+            },
+            { correlationId }
+          );
+          this.stats.timeoutCount++;
+          this.stats.failureCount++;
+        } else if (isCancelled) {
+          // Mark as cancelled (user-initiated cancellation, not timeout)
+          this.queue.cancel(task.id);
+
+          await this.eventBus.publish(
+            "task.cancelled",
+            {
+              taskId: task.id,
+              taskType: task.taskType,
+              reason: error === "cancelled" ? "cancelled by user" : errorMsg,
+              durationMs: result.durationMs,
+            },
+            { correlationId }
+          );
+          this.stats.cancelledCount++;
+        } else {
+          // Mark as failed (generic error)
+          this.queue.fail(task.id, errorMsg);
+
+          await this.eventBus.publish(
+            "task.failed",
+            {
+              taskId: task.id,
+              taskType: task.taskType,
+              error: errorMsg,
+              durationMs: result.durationMs,
+            },
+            { correlationId }
+          );
+          this.stats.failureCount++;
+        }
+      }
+    }
+
+    // Update stats
+    this.stats.totalProcessed++;
+    this.stats.totalDurationMs += result.durationMs;
+
+    // Remove from running tasks
+    this.runningTasks.delete(task.id);
+
+    return result;
+  }
+
+  /**
    * Check if the dispatcher is currently running.
    */
   isRunning(): boolean {
@@ -328,16 +584,14 @@ export class Dispatcher {
   getStats(): DispatcherStats {
     return {
       isRunning: this.running,
-      totalProcessed: this.counters.totalProcessed,
-      successCount: this.counters.successCount,
-      failureCount: this.counters.failureCount,
-      cancelledCount: this.counters.cancelledCount,
+      totalProcessed: this.stats.totalProcessed,
+      successCount: this.stats.successCount,
+      failureCount: this.stats.failureCount,
+      cancelledCount: this.stats.cancelledCount,
       runningCount: this.runningTasks.size,
-      timeoutCount: this.counters.timeoutCount,
+      timeoutCount: this.stats.timeoutCount,
       avgDurationMs:
-        this.counters.totalProcessed > 0
-          ? this.counters.totalDurationMs / this.counters.totalProcessed
-          : 0,
+        this.stats.totalProcessed > 0 ? this.stats.totalDurationMs / this.stats.totalProcessed : 0,
       uptimeMs: this.startedAt ? Date.now() - this.startedAt.getTime() : 0,
     };
   }
@@ -364,6 +618,6 @@ export class Dispatcher {
    * @returns Execution result
    */
   async executeOnce(task: QueuedTask): Promise<TaskExecutionResult> {
-    return this.executor.execute(task);
+    return this.executeTask(task);
   }
 }
