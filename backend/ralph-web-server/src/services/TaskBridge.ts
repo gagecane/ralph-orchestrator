@@ -24,7 +24,7 @@
  * - `TaskBridge.types.ts`         — event payload and public result types
  * - `TaskBridge.helpers.ts`       — `getGitRepoRoot`, `extractSummaryFromOutput`
  * - `TaskBridge.configResolver.ts` — preset/config → `-c <path>` CLI args
- * - `TaskBridge.loopResolver.ts`  — loop ID lookup from `.ralph/` state
+ * - `TaskBridge.loopResolver.ts`  — loop ID lookup + post-start polling helper
  * - `TaskBridge.eventHandlers.ts` — EventBus → DB lifecycle handlers
  * - `TaskBridge.lifecycle.ts`     — recover / reconnect / cancel helpers
  */
@@ -39,7 +39,7 @@ import { EventBus, Subscription } from "../queue/EventBus";
 import { Task } from "../db/schema";
 
 import { resolveConfigArgs } from "./TaskBridge.configResolver";
-import { resolveLoopId } from "./TaskBridge.loopResolver";
+import { scheduleLoopIdResolution } from "./TaskBridge.loopResolver";
 import { subscribeLifecycleEvents } from "./TaskBridge.eventHandlers";
 import {
   cancelTask as cancelTaskImpl,
@@ -316,40 +316,21 @@ export class TaskBridge {
 
   /**
    * Poll for loop ID resolution after a task starts.
-   * The loop entry in `.ralph/loops.json` may appear with a slight delay
-   * after the CLI process spawns. Polls up to 5 times at 2-second intervals.
+   *
+   * Thin delegation to `scheduleLoopIdResolution` in `TaskBridge.loopResolver`.
+   * Kept as a private method so the event-handler deps can bind `this` once
+   * in the constructor.
    *
    * @param dbTaskId - The database task ID to update once the loop ID is found
    */
   private scheduleLoopIdResolution(dbTaskId: string): void {
-    const dbTask = this.taskRepository.findById(dbTaskId);
-    if (!dbTask) return;
-
-    const taskTitle = dbTask.title;
-    let attempts = 0;
-    const maxAttempts = 5;
-    const intervalMs = 2000;
-
-    const poll = () => {
-      attempts++;
-      const loopId = resolveLoopId(this.defaultCwd, taskTitle);
-
-      if (loopId) {
-        // Verify the task still exists and doesn't already have a loopId
-        const current = this.taskRepository.findById(dbTaskId);
-        if (current && !current.loopId) {
-          this.taskRepository.update(dbTaskId, { loopId });
-        }
-        return; // Done
-      }
-
-      if (attempts < maxAttempts) {
-        setTimeout(poll, intervalMs);
-      }
-    };
-
-    // Start polling after an initial delay to give the CLI time to register the loop
-    setTimeout(poll, intervalMs);
+    scheduleLoopIdResolution(
+      {
+        taskRepository: this.taskRepository,
+        defaultCwd: this.defaultCwd,
+      },
+      dbTaskId
+    );
   }
 
   /**
