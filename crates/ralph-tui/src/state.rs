@@ -1,0 +1,2760 @@
+//! State management for the TUI.
+
+use ralph_proto::{Event, HatId};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+// ============================================================================
+// TaskSummary - Summary of a single task for TUI display
+// ============================================================================
+
+/// Summary of a task for TUI display.
+/// Contains only the fields needed for rendering.
+#[derive(Debug, Clone, Default)]
+pub struct TaskSummary {
+    /// Task identifier (e.g., "task-1737372000-a1b2").
+    pub id: String,
+    /// Task title/description.
+    pub title: String,
+    /// Task status (e.g., "open", "closed", "blocked").
+    pub status: String,
+}
+
+impl TaskSummary {
+    /// Creates a new task summary.
+    pub fn new(id: impl Into<String>, title: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            status: status.into(),
+        }
+    }
+}
+
+// ============================================================================
+// TaskCounts - Aggregate task statistics for TUI display
+// ============================================================================
+
+/// Aggregate task statistics for TUI display.
+#[derive(Debug, Clone, Default)]
+pub struct TaskCounts {
+    /// Total number of tasks.
+    pub total: usize,
+    /// Number of open tasks.
+    pub open: usize,
+    /// Number of closed tasks.
+    pub closed: usize,
+    /// Number of ready (unblocked) tasks.
+    pub ready: usize,
+}
+
+impl TaskCounts {
+    /// Creates new task counts.
+    pub fn new(total: usize, open: usize, closed: usize, ready: usize) -> Self {
+        Self {
+            total,
+            open,
+            closed,
+            ready,
+        }
+    }
+}
+
+// ============================================================================
+// SearchState - Search functionality for TUI content
+// ============================================================================
+
+/// Search state for finding and navigating matches in TUI content.
+/// Tracks the current query, match positions, and navigation index.
+#[derive(Debug, Default)]
+pub struct SearchState {
+    /// Current search query (None when no active search).
+    pub query: Option<String>,
+    /// Match positions as (line_index, char_offset) pairs.
+    pub matches: Vec<(usize, usize)>,
+    /// Index into matches vector for current match.
+    pub current_match: usize,
+    /// Whether search input mode is active (user is typing query).
+    pub search_mode: bool,
+}
+
+impl SearchState {
+    /// Creates a new empty search state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears all search state.
+    pub fn clear(&mut self) {
+        self.query = None;
+        self.matches.clear();
+        self.current_match = 0;
+        self.search_mode = false;
+    }
+}
+
+/// Whether guidance is being entered for the next or current iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidanceMode {
+    /// Guidance for the next prompt boundary.
+    Next,
+    /// Urgent steer for the active iteration.
+    Now,
+}
+
+/// Result of attempting to send guidance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidanceResult {
+    /// Next-iteration guidance was queued successfully.
+    Queued,
+    /// Urgent steer was persisted successfully.
+    Sent,
+    /// Guidance could not be queued/written.
+    Failed,
+}
+
+/// Status of the background update check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateStatus {
+    /// No check result yet.
+    Unknown,
+    /// The running version matches the latest known release.
+    UpToDate,
+    /// A newer release is available.
+    Available { latest: String },
+}
+
+// ============================================================================
+// WaveInfo - Active wave tracking for TUI header display
+// ============================================================================
+
+/// Tracks active wave execution for header display and per-worker output.
+///
+/// Manual `Debug` impl because `worker_buffers` contains `Arc<Mutex<>>` fields.
+pub struct WaveInfo {
+    pub hat_name: String,
+    pub total: u32,
+    pub completed: u32,
+    pub started_at: Instant,
+    /// Per-worker output buffers (indexed by worker_index).
+    pub worker_buffers: Vec<IterationBuffer>,
+}
+
+impl std::fmt::Debug for WaveInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaveInfo")
+            .field("hat_name", &self.hat_name)
+            .field("total", &self.total)
+            .field("completed", &self.completed)
+            .field("started_at", &self.started_at)
+            .field("worker_buffers_len", &self.worker_buffers.len())
+            .finish()
+    }
+}
+
+impl WaveInfo {
+    /// Creates a new WaveInfo with N empty worker buffers.
+    pub fn new(hat_name: String, total: u32) -> Self {
+        let worker_buffers = (0..total)
+            .map(|i| {
+                let mut buf = IterationBuffer::new(i + 1);
+                buf.hat_display = Some(format!("Worker {}/{}", i + 1, total));
+                buf
+            })
+            .collect();
+        Self {
+            hat_name,
+            total,
+            completed: 0,
+            started_at: Instant::now(),
+            worker_buffers,
+        }
+    }
+}
+
+/// Observable state derived from loop events.
+pub struct TuiState {
+    /// Which hat will process next event (ID + display name).
+    pub pending_hat: Option<(HatId, String)>,
+    /// Backend expected for the next iteration (used when metadata is missing).
+    pub pending_backend: Option<String>,
+    /// Current iteration number (0-indexed, display as +1).
+    pub iteration: u32,
+    /// Previous iteration number (for detecting changes).
+    pub prev_iteration: u32,
+    /// When loop began.
+    pub loop_started: Option<Instant>,
+    /// When current iteration began.
+    pub iteration_started: Option<Instant>,
+    /// Most recent event topic.
+    pub last_event: Option<String>,
+    /// Timestamp of last event.
+    pub last_event_at: Option<Instant>,
+    /// Whether to show help overlay.
+    pub show_help: bool,
+    /// Whether mouse capture is enabled for wheel scrolling.
+    /// When false, the terminal keeps native drag-to-select behavior.
+    pub mouse_capture_enabled: bool,
+    /// Whether in scroll mode.
+    pub in_scroll_mode: bool,
+    /// Current search query (if in search input mode).
+    pub search_query: String,
+    /// Search direction (true = forward, false = backward).
+    pub search_forward: bool,
+    /// Maximum iterations from config.
+    pub max_iterations: Option<u32>,
+    /// Idle timeout countdown.
+    pub idle_timeout_remaining: Option<Duration>,
+    /// Status of the asynchronous update check.
+    pub update_status: UpdateStatus,
+    /// Git branch for the workspace the TUI was launched from.
+    current_branch: Option<String>,
+    /// Map of event topics to hat display information (for custom hats).
+    /// Key: event topic (e.g., "review.security")
+    /// Value: (HatId, display name including emoji)
+    hat_map: HashMap<String, (HatId, String)>,
+
+    // ========================================================================
+    // Iteration Management (new fields for TUI refactor)
+    // ========================================================================
+    /// Content buffers for each iteration.
+    pub iterations: Vec<IterationBuffer>,
+    /// Index of the iteration currently being viewed (0-indexed).
+    pub current_view: usize,
+    /// Whether to automatically follow the latest iteration.
+    pub following_latest: bool,
+    /// Alert about a new iteration (shown when viewing history and new iteration arrives).
+    /// Contains the iteration number to alert about. Cleared when navigating to latest.
+    pub new_iteration_alert: Option<usize>,
+
+    // ========================================================================
+    // Search State
+    // ========================================================================
+    /// Search state for finding and navigating matches in iteration content.
+    pub search_state: SearchState,
+
+    // ========================================================================
+    // Completion State
+    // ========================================================================
+    /// Whether the loop has completed (received loop.terminate event).
+    pub loop_completed: bool,
+    /// Frozen elapsed time when loop completed (timer stops at this value).
+    pub final_iteration_elapsed: Option<Duration>,
+    /// Frozen total elapsed time when loop completed (footer timer stops).
+    pub final_loop_elapsed: Option<Duration>,
+
+    // ========================================================================
+    // Task Tracking State
+    // ========================================================================
+    /// Aggregate task counts for display in TUI widgets.
+    pub task_counts: TaskCounts,
+    /// Currently active task (if any) for display in TUI widgets.
+    pub active_task: Option<TaskSummary>,
+
+    // ========================================================================
+    // Wave State
+    // ========================================================================
+    /// Active wave info for header display (only set while a wave is running).
+    pub wave_active: Option<WaveInfo>,
+    /// Index into `iterations` that the active wave belongs to.
+    /// Used by `wave_info_for_view()` to only return `wave_active` when viewing
+    /// the specific iteration that owns the running wave.
+    pub wave_active_iteration_idx: Option<usize>,
+    /// Whether the wave worker drill-down view is active.
+    pub wave_view_active: bool,
+    /// Index of the worker currently being viewed in wave view (0-indexed).
+    pub wave_view_index: usize,
+
+    // ========================================================================
+    // Guidance State
+    // ========================================================================
+    /// Active guidance input mode (None when not entering guidance).
+    pub guidance_mode: Option<GuidanceMode>,
+    /// Text being typed in guidance input.
+    pub guidance_input: String,
+    /// Queue of guidance messages for the next iteration (drained by loop_runner).
+    pub guidance_next_queue: Arc<Mutex<Vec<String>>>,
+    /// Path to events.jsonl for writing urgent guidance for the next prompt.
+    pub events_path: Option<std::path::PathBuf>,
+    /// Path to the urgent-steer marker file used to gate `ralph emit`.
+    pub urgent_steer_path: Option<std::path::PathBuf>,
+    /// Brief flash message after attempting to send guidance.
+    /// (mode, result, when)
+    pub guidance_flash: Option<(GuidanceMode, GuidanceResult, Instant)>,
+
+    // ========================================================================
+    // Subprocess Error State
+    // ========================================================================
+    /// Error message set when subprocess exits before sending any RPC events.
+    /// When set, the TUI displays an error state instead of empty content.
+    pub subprocess_error: Option<String>,
+
+    // ========================================================================
+    // RPC Text Accumulation State
+    // ========================================================================
+    /// Buffer for accumulating streaming text deltas received via RPC.
+    /// Text is rendered as a group when frozen (on tool call, error, or iteration end)
+    /// rather than rendering each small delta independently.
+    pub rpc_text_buffer: String,
+    /// Number of lines in the current iteration buffer that belong to the
+    /// current (unfrozen) text. When new text arrives, these lines are
+    /// replaced with a fresh render of the full accumulated text.
+    pub rpc_text_line_count: usize,
+}
+
+impl TuiState {
+    /// Creates empty state. Timer starts immediately at creation.
+    pub fn new() -> Self {
+        Self {
+            pending_hat: None,
+            pending_backend: None,
+            iteration: 0,
+            prev_iteration: 0,
+            loop_started: Some(Instant::now()),
+            iteration_started: None,
+            last_event: None,
+            last_event_at: None,
+            show_help: false,
+            mouse_capture_enabled: false,
+            in_scroll_mode: false,
+            search_query: String::new(),
+            search_forward: true,
+            max_iterations: None,
+            idle_timeout_remaining: None,
+            update_status: UpdateStatus::Unknown,
+            current_branch: None,
+            hat_map: HashMap::new(),
+            // Iteration management
+            iterations: Vec::new(),
+            current_view: 0,
+            following_latest: true,
+            new_iteration_alert: None,
+            // Search state
+            search_state: SearchState::new(),
+            // Completion state
+            loop_completed: false,
+            final_iteration_elapsed: None,
+            final_loop_elapsed: None,
+            // Task tracking state
+            task_counts: TaskCounts::default(),
+            active_task: None,
+            // Wave state
+            wave_active: None,
+            wave_active_iteration_idx: None,
+            wave_view_active: false,
+            wave_view_index: 0,
+            // Guidance state
+            guidance_mode: None,
+            guidance_input: String::new(),
+            guidance_next_queue: Arc::new(Mutex::new(Vec::new())),
+            events_path: None,
+            urgent_steer_path: None,
+            guidance_flash: None,
+            // Subprocess error state
+            subprocess_error: None,
+            // RPC text accumulation state
+            rpc_text_buffer: String::new(),
+            rpc_text_line_count: 0,
+        }
+    }
+
+    /// Creates state with a custom hat map for dynamic topic-to-hat resolution.
+    /// Timer starts immediately at creation.
+    pub fn with_hat_map(hat_map: HashMap<String, (HatId, String)>) -> Self {
+        let mut state = Self::new();
+        state.hat_map = hat_map;
+        state
+    }
+
+    /// Sets the git branch displayed by the TUI.
+    pub fn set_current_branch(&mut self, branch: Option<String>) {
+        self.current_branch = branch;
+    }
+
+    /// Returns the git branch displayed by the TUI, if known.
+    pub fn current_branch(&self) -> Option<&str> {
+        self.current_branch.as_deref()
+    }
+
+    /// Replaces the dynamic topic-to-hat mapping without resetting the rest of the state.
+    pub fn set_hat_map(&mut self, hat_map: HashMap<String, (HatId, String)>) {
+        self.hat_map = hat_map;
+    }
+
+    /// Updates state based on event topic.
+    pub fn update(&mut self, event: &Event) {
+        let now = Instant::now();
+        let topic = event.topic.as_str();
+
+        self.last_event = Some(topic.to_string());
+        self.last_event_at = Some(now);
+
+        let custom_hat = self.hat_map.get(topic).cloned();
+        if let Some((hat_id, hat_display)) = custom_hat.clone() {
+            self.pending_hat = Some((hat_id, hat_display));
+            // Handle iteration timing for custom hats
+            if topic.starts_with("build.") {
+                self.iteration_started = Some(now);
+            }
+        }
+
+        // Fall back to hardcoded mappings for backward compatibility
+        match topic {
+            "task.start" => {
+                // Save state we want to preserve across reset
+                let saved_hat_map = std::mem::take(&mut self.hat_map);
+                let saved_loop_started = self.loop_started; // Preserve timer from TUI init
+                let saved_max_iterations = self.max_iterations;
+                // Preserve iteration buffers so TUI history survives across task restarts
+                let saved_iterations = std::mem::take(&mut self.iterations);
+                let saved_current_view = self.current_view;
+                let saved_following_latest = self.following_latest;
+                let saved_new_iteration_alert = self.new_iteration_alert.take();
+                let saved_pending_backend = self.pending_backend.clone();
+                let saved_current_branch = self.current_branch.clone();
+                let saved_guidance_next_queue = Arc::clone(&self.guidance_next_queue);
+                let saved_events_path = self.events_path.clone();
+                let saved_urgent_steer_path = self.urgent_steer_path.clone();
+                *self = Self::new();
+                self.hat_map = saved_hat_map;
+                self.loop_started = saved_loop_started; // Keep original timer
+                self.max_iterations = saved_max_iterations;
+                self.iterations = saved_iterations;
+                self.current_view = saved_current_view;
+                self.following_latest = saved_following_latest;
+                self.new_iteration_alert = saved_new_iteration_alert;
+                self.pending_backend = saved_pending_backend;
+                self.current_branch = saved_current_branch;
+                self.guidance_next_queue = saved_guidance_next_queue;
+                self.events_path = saved_events_path;
+                self.urgent_steer_path = saved_urgent_steer_path;
+                if let Some((hat_id, hat_display)) = custom_hat {
+                    self.pending_hat = Some((hat_id, hat_display));
+                } else {
+                    self.pending_hat = Some((HatId::new("planner"), "📋Planner".to_string()));
+                }
+                self.last_event = Some(topic.to_string());
+                self.last_event_at = Some(now);
+            }
+            "task.resume" => {
+                // Don't reset timer on resume - keep counting from TUI init
+                if custom_hat.is_none() {
+                    self.pending_hat = Some((HatId::new("planner"), "📋Planner".to_string()));
+                }
+            }
+            "build.task" => {
+                if custom_hat.is_none() {
+                    self.pending_hat = Some((HatId::new("builder"), "🔨Builder".to_string()));
+                }
+                // Resume the loop timer if a new iteration starts after a freeze.
+                self.final_loop_elapsed = None;
+                self.iteration_started = Some(now);
+            }
+            "build.done" => {
+                if custom_hat.is_none() {
+                    self.pending_hat = Some((HatId::new("planner"), "📋Planner".to_string()));
+                }
+                self.prev_iteration = self.iteration;
+                self.iteration += 1;
+                self.finish_latest_iteration();
+                self.freeze_loop_elapsed();
+            }
+            "build.blocked" => {
+                if custom_hat.is_none() {
+                    self.pending_hat = Some((HatId::new("planner"), "📋Planner".to_string()));
+                }
+                self.finish_latest_iteration();
+                self.freeze_loop_elapsed();
+            }
+            "loop.terminate" => {
+                self.pending_hat = None;
+                self.loop_completed = true;
+                // Freeze the iteration timer at its current value
+                self.final_iteration_elapsed = self.iteration_started.map(|start| start.elapsed());
+                // Freeze the total loop timer for the footer display
+                self.freeze_loop_elapsed();
+                self.finish_latest_iteration();
+            }
+            _ => {
+                // Unknown topic - don't change pending_hat
+            }
+        }
+    }
+
+    /// Returns formatted hat display (emoji + name).
+    pub fn get_pending_hat_display(&self) -> String {
+        self.pending_hat
+            .as_ref()
+            .map_or_else(|| "—".to_string(), |(_, display)| display.clone())
+    }
+
+    /// Time since loop started.
+    pub fn get_loop_elapsed(&self) -> Option<Duration> {
+        if let Some(final_elapsed) = self.final_loop_elapsed {
+            return Some(final_elapsed);
+        }
+        self.loop_started.map(|start| start.elapsed())
+    }
+
+    /// Time since iteration started, or frozen value if loop completed.
+    pub fn get_iteration_elapsed(&self) -> Option<Duration> {
+        if let Some(buffer) = self.current_iteration() {
+            if let Some(elapsed) = buffer.elapsed {
+                return Some(elapsed);
+            }
+            if let Some(started_at) = buffer.started_at {
+                return Some(started_at.elapsed());
+            }
+        }
+        if let Some(final_elapsed) = self.final_iteration_elapsed {
+            return Some(final_elapsed);
+        }
+        self.iteration_started.map(|start| start.elapsed())
+    }
+
+    /// True if event received in last 2 seconds.
+    pub fn is_active(&self) -> bool {
+        self.last_event_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+    }
+
+    /// True if iteration changed since last check.
+    pub fn iteration_changed(&self) -> bool {
+        self.iteration != self.prev_iteration
+    }
+
+    // ========================================================================
+    // Task Tracking Methods
+    // ========================================================================
+
+    /// Returns a reference to the current task counts.
+    pub fn get_task_counts(&self) -> &TaskCounts {
+        &self.task_counts
+    }
+
+    /// Returns a reference to the active task, if any.
+    pub fn get_active_task(&self) -> Option<&TaskSummary> {
+        self.active_task.as_ref()
+    }
+
+    /// Updates the task counts.
+    pub fn set_task_counts(&mut self, counts: TaskCounts) {
+        self.task_counts = counts;
+    }
+
+    /// Sets the active task.
+    pub fn set_active_task(&mut self, task: Option<TaskSummary>) {
+        self.active_task = task;
+    }
+
+    /// Returns true if there are any open tasks.
+    pub fn has_open_tasks(&self) -> bool {
+        self.task_counts.open > 0
+    }
+
+    /// Returns a formatted string for task progress display (e.g., "3/5 tasks").
+    pub fn get_task_progress_display(&self) -> String {
+        if self.task_counts.total == 0 {
+            "No tasks".to_string()
+        } else {
+            format!(
+                "{}/{} tasks",
+                self.task_counts.closed, self.task_counts.total
+            )
+        }
+    }
+
+    // ========================================================================
+    // Iteration Management Methods
+    // ========================================================================
+
+    /// Starts a new iteration, creating a new IterationBuffer.
+    /// If following_latest is true, current_view is updated to the new iteration.
+    /// If not following, sets the new_iteration_alert to notify the user.
+    pub fn start_new_iteration(&mut self) {
+        self.start_new_iteration_with_metadata(None, None);
+    }
+
+    /// Starts a new iteration with optional metadata for hat and backend display.
+    pub fn start_new_iteration_with_metadata(
+        &mut self,
+        hat_display: Option<String>,
+        backend: Option<String>,
+    ) {
+        // Reset text accumulation buffer for the new iteration
+        self.rpc_text_buffer.clear();
+        self.rpc_text_line_count = 0;
+
+        // Exit wave view on new iteration — the user can re-enter with 'w'.
+        // Wave data is preserved per-iteration on the IterationBuffer, so users
+        // can navigate to any iteration and press 'w' to review its wave workers.
+        self.wave_view_active = false;
+
+        // Resume the total loop timer — it gets frozen on build.done/build.blocked
+        // but should keep ticking when the next iteration starts.
+        self.final_loop_elapsed = None;
+
+        let hat_display = hat_display.or_else(|| {
+            self.pending_hat
+                .as_ref()
+                .map(|(_, display)| display.clone())
+        });
+        let backend = backend.or_else(|| self.pending_backend.clone());
+        let number = (self.iterations.len() + 1) as u32;
+        let mut buffer = IterationBuffer::new(number);
+        buffer.hat_display = hat_display;
+        buffer.backend = backend;
+        buffer.started_at = Some(Instant::now());
+        if buffer.backend.is_some() {
+            self.pending_backend = buffer.backend.clone();
+        }
+        self.iterations.push(buffer);
+
+        // Auto-follow if enabled
+        if self.following_latest {
+            self.current_view = self.iterations.len().saturating_sub(1);
+        } else {
+            // Alert user about new iteration when reviewing history
+            self.new_iteration_alert = Some(number as usize);
+        }
+    }
+
+    /// Finalizes the latest iteration's elapsed time if it isn't already set.
+    pub fn finish_latest_iteration(&mut self) {
+        let Some(buffer) = self.iterations.last_mut() else {
+            return;
+        };
+        if buffer.elapsed.is_some() {
+            return;
+        }
+        if let Some(started_at) = buffer.started_at {
+            buffer.elapsed = Some(started_at.elapsed());
+        }
+    }
+
+    /// Freeze total loop elapsed time for the footer if it is still ticking.
+    fn freeze_loop_elapsed(&mut self) {
+        if self.final_loop_elapsed.is_some() {
+            return;
+        }
+        self.final_loop_elapsed = self.loop_started.map(|start| start.elapsed());
+    }
+
+    /// Returns the hat display for the currently viewed iteration, if available.
+    pub fn current_iteration_hat_display(&self) -> Option<&str> {
+        self.current_iteration()
+            .and_then(|buffer| buffer.hat_display.as_deref())
+    }
+
+    /// Returns the backend display for the currently viewed iteration, if available.
+    pub fn current_iteration_backend(&self) -> Option<&str> {
+        self.current_iteration()
+            .and_then(|buffer| buffer.backend.as_deref())
+    }
+
+    /// Returns a reference to the currently viewed iteration buffer.
+    pub fn current_iteration(&self) -> Option<&IterationBuffer> {
+        self.iterations.get(self.current_view)
+    }
+
+    /// Returns a mutable reference to the currently viewed iteration buffer.
+    pub fn current_iteration_mut(&mut self) -> Option<&mut IterationBuffer> {
+        self.iterations.get_mut(self.current_view)
+    }
+
+    /// Returns a shared handle to the current iteration's lines buffer.
+    ///
+    /// This allows stream handlers to write directly to the buffer,
+    /// enabling real-time streaming to the TUI during execution.
+    pub fn current_iteration_lines_handle(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<Vec<Line<'static>>>>> {
+        self.iterations
+            .get(self.current_view)
+            .map(|buffer| buffer.lines_handle())
+    }
+
+    /// Returns a shared handle to the latest iteration's lines buffer.
+    ///
+    /// This should be used when writing output from the currently executing
+    /// iteration, regardless of which iteration the user is viewing.
+    /// This prevents output from being written to the wrong iteration when
+    /// the user is reviewing an older iteration.
+    pub fn latest_iteration_lines_handle(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<Vec<Line<'static>>>>> {
+        self.iterations.last().map(|buffer| buffer.lines_handle())
+    }
+
+    /// Navigates to the next iteration (if not at the last one).
+    /// If reaching the last iteration, re-enables following_latest and clears alerts.
+    pub fn navigate_next(&mut self) {
+        if self.iterations.is_empty() {
+            return;
+        }
+        let max_index = self.iterations.len().saturating_sub(1);
+        if self.current_view < max_index {
+            self.current_view += 1;
+            // Re-enable following when reaching the latest
+            if self.current_view == max_index {
+                self.following_latest = true;
+                self.new_iteration_alert = None;
+            }
+        }
+    }
+
+    /// Navigates to the previous iteration (if not at the first one).
+    /// Disables following_latest when navigating backwards.
+    pub fn navigate_prev(&mut self) {
+        if self.current_view > 0 {
+            self.current_view -= 1;
+            self.following_latest = false;
+        }
+    }
+
+    /// Returns the total number of iterations.
+    pub fn total_iterations(&self) -> usize {
+        self.iterations.len()
+    }
+
+    // ========================================================================
+    // Search Methods
+    // ========================================================================
+
+    /// Searches for the given query in the current iteration's content.
+    /// Populates matches with (line_index, char_offset) pairs.
+    /// Search is case-insensitive.
+    pub fn search(&mut self, query: &str) {
+        self.search_state.query = Some(query.to_string());
+        self.search_state.matches.clear();
+        self.search_state.current_match = 0;
+
+        // Check if we have an iteration to search
+        if self.iterations.get(self.current_view).is_none() {
+            return;
+        }
+
+        let query_lower = query.to_lowercase();
+
+        // Collect matches first (avoid borrow conflicts)
+        let matches: Vec<(usize, usize)> = self
+            .iterations
+            .get(self.current_view)
+            .and_then(|buffer| {
+                let lines = buffer.lines.lock().ok()?;
+                let mut found = Vec::new();
+                for (line_idx, line) in lines.iter().enumerate() {
+                    // Get the text content of the line
+                    let line_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    let line_lower = line_text.to_lowercase();
+
+                    // Find all occurrences in this line
+                    let mut search_start = 0;
+                    while let Some(pos) = line_lower[search_start..].find(&query_lower) {
+                        let char_offset = search_start + pos;
+                        found.push((line_idx, char_offset));
+                        search_start = char_offset + query_lower.len();
+                    }
+                }
+                Some(found)
+            })
+            .unwrap_or_default();
+
+        self.search_state.matches = matches;
+
+        // Jump to first match if any exist
+        if !self.search_state.matches.is_empty() {
+            self.jump_to_current_match();
+        }
+    }
+
+    /// Navigates to the next match, cycling back to the first if at the end.
+    pub fn next_match(&mut self) {
+        if self.search_state.matches.is_empty() {
+            return;
+        }
+
+        self.search_state.current_match =
+            (self.search_state.current_match + 1) % self.search_state.matches.len();
+        self.jump_to_current_match();
+    }
+
+    /// Navigates to the previous match, cycling to the last if at the beginning.
+    pub fn prev_match(&mut self) {
+        if self.search_state.matches.is_empty() {
+            return;
+        }
+
+        if self.search_state.current_match == 0 {
+            self.search_state.current_match = self.search_state.matches.len() - 1;
+        } else {
+            self.search_state.current_match -= 1;
+        }
+        self.jump_to_current_match();
+    }
+
+    /// Clears the search state.
+    pub fn clear_search(&mut self) {
+        self.search_state.clear();
+    }
+
+    /// Jumps to the current match by adjusting scroll_offset to show the match line.
+    fn jump_to_current_match(&mut self) {
+        if self.search_state.matches.is_empty() {
+            return;
+        }
+
+        let (line_idx, _) = self.search_state.matches[self.search_state.current_match];
+
+        // Adjust scroll to show the match line
+        // Use a default viewport height for calculation (will be overridden by actual render)
+        let viewport_height = 20;
+        if let Some(buffer) = self.current_iteration_mut() {
+            // If the match line is above the current view, scroll up to it
+            if line_idx < buffer.scroll_offset {
+                buffer.scroll_offset = line_idx;
+            }
+            // If the match line is below the current view, scroll down to show it
+            else if line_idx >= buffer.scroll_offset + viewport_height {
+                buffer.scroll_offset = line_idx.saturating_sub(viewport_height / 2);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Guidance Methods
+    // ========================================================================
+
+    /// Enters guidance input mode.
+    pub fn start_guidance(&mut self, mode: GuidanceMode) {
+        self.guidance_mode = Some(mode);
+        self.guidance_input.clear();
+        self.guidance_flash = None;
+    }
+
+    /// Cancels guidance input without sending.
+    pub fn cancel_guidance(&mut self) {
+        self.guidance_mode = None;
+        self.guidance_input.clear();
+    }
+
+    /// Sends the current guidance input.
+    ///
+    /// For `GuidanceMode::Next`, pushes to the shared queue (drained by loop_runner).
+    /// For `GuidanceMode::Now`, writes an urgent-steer marker immediately and
+    /// records `human.guidance` for the next prompt boundary.
+    ///
+    /// Returns true if guidance was sent successfully.
+    pub fn send_guidance(&mut self) -> bool {
+        let input = self.guidance_input.trim().to_string();
+        if input.is_empty() {
+            self.cancel_guidance();
+            return false;
+        }
+
+        let mode = match self.guidance_mode {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let (ok, result) = match mode {
+            GuidanceMode::Next => {
+                if let Ok(mut queue) = self.guidance_next_queue.lock() {
+                    queue.push(input);
+                    (true, GuidanceResult::Queued)
+                } else {
+                    (false, GuidanceResult::Failed)
+                }
+            }
+            GuidanceMode::Now => {
+                let ok =
+                    self.write_urgent_steer_marker(&input) && self.write_guidance_event(&input);
+                if ok {
+                    (true, GuidanceResult::Sent)
+                } else {
+                    (false, GuidanceResult::Failed)
+                }
+            }
+        };
+
+        self.guidance_flash = Some((mode, result, Instant::now()));
+        self.guidance_mode = None;
+        self.guidance_input.clear();
+        ok
+    }
+
+    /// Writes a human.guidance event directly to events.jsonl.
+    fn write_guidance_event(&self, message: &str) -> bool {
+        let Some(ref path) = self.events_path else {
+            return false;
+        };
+
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let event = serde_json::json!({
+            "topic": "human.guidance",
+            "payload": message,
+            "ts": timestamp,
+        });
+
+        let line = match serde_json::to_string(&event) {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+
+        file.write_all(line.as_bytes()).is_ok() && file.write_all(b"\n").is_ok()
+    }
+
+    fn write_urgent_steer_marker(&self, message: &str) -> bool {
+        let Some(ref path) = self.urgent_steer_path else {
+            return false;
+        };
+
+        ralph_core::UrgentSteerStore::new(path.clone())
+            .append_message(message.to_string())
+            .is_ok()
+    }
+
+    /// Returns true if guidance input is currently active.
+    pub fn is_guidance_active(&self) -> bool {
+        self.guidance_mode.is_some()
+    }
+
+    /// Clears flash message if it has expired.
+    pub fn clear_expired_guidance_flash(&mut self) {
+        if let Some((_, _, when)) = self.guidance_flash
+            && when.elapsed() >= Duration::from_secs(2)
+        {
+            self.guidance_flash = None;
+        }
+    }
+
+    /// Returns active guidance flash (mode + result) if still within display window (2 seconds).
+    pub fn active_guidance_flash(&self) -> Option<(GuidanceMode, GuidanceResult)> {
+        self.guidance_flash.and_then(|(mode, result, when)| {
+            if when.elapsed() < Duration::from_secs(2) {
+                Some((mode, result))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Updates the cached result of the asynchronous version check.
+    pub fn set_update_status(&mut self, status: UpdateStatus) {
+        self.update_status = status;
+    }
+
+    // ========================================================================
+    // Wave View Methods
+    // ========================================================================
+
+    /// Returns the WaveInfo to use for wave view.
+    ///
+    /// If viewing the iteration that owns the active wave, returns the live
+    /// `wave_active` (for real-time streaming). Otherwise returns the stored
+    /// wave data from the currently viewed iteration buffer.
+    fn wave_info_for_view(&self) -> Option<&WaveInfo> {
+        // Active wave takes priority when viewing its owning iteration
+        if let Some(wave_iter) = self.wave_active_iteration_idx
+            && self.current_view == wave_iter
+            && self.wave_active.is_some()
+        {
+            return self.wave_active.as_ref();
+        }
+        // Fall back to the per-iteration stored wave data
+        self.iterations
+            .get(self.current_view)
+            .and_then(|buf| buf.wave_info.as_ref())
+    }
+
+    /// Returns the WaveInfo to use for wave view (mutable).
+    fn wave_info_for_view_mut(&mut self) -> Option<&mut WaveInfo> {
+        if let Some(wave_iter) = self.wave_active_iteration_idx
+            && self.current_view == wave_iter
+            && self.wave_active.is_some()
+        {
+            return self.wave_active.as_mut();
+        }
+        let idx = self.current_view;
+        self.iterations
+            .get_mut(idx)
+            .and_then(|buf| buf.wave_info.as_mut())
+    }
+
+    /// Returns the WaveInfo for the current wave view (public, for header rendering).
+    pub fn wave_info_for_wave_view(&self) -> Option<&WaveInfo> {
+        self.wave_info_for_view()
+    }
+
+    /// Enters wave worker drill-down view. No-op if no wave data exists.
+    pub fn enter_wave_view(&mut self) {
+        if self.wave_info_for_view().is_some() {
+            self.wave_view_active = true;
+            self.wave_view_index = 0;
+        }
+    }
+
+    /// Exits wave worker drill-down view.
+    pub fn exit_wave_view(&mut self) {
+        self.wave_view_active = false;
+    }
+
+    /// Cycles to the next worker in wave view.
+    pub fn wave_view_next(&mut self) {
+        if let Some(wave) = self.wave_info_for_view() {
+            let total = wave.worker_buffers.len();
+            if total > 0 {
+                self.wave_view_index = (self.wave_view_index + 1) % total;
+            }
+        }
+    }
+
+    /// Cycles to the previous worker in wave view.
+    pub fn wave_view_prev(&mut self) {
+        if let Some(wave) = self.wave_info_for_view() {
+            let total = wave.worker_buffers.len();
+            if total > 0 {
+                if self.wave_view_index == 0 {
+                    self.wave_view_index = total - 1;
+                } else {
+                    self.wave_view_index -= 1;
+                }
+            }
+        }
+    }
+
+    /// Returns the current wave worker buffer (immutable) for rendering.
+    pub fn current_wave_worker_buffer(&self) -> Option<&IterationBuffer> {
+        self.wave_info_for_view()
+            .and_then(|w| w.worker_buffers.get(self.wave_view_index))
+    }
+
+    /// Returns the current wave worker buffer (mutable) for scrolling.
+    pub fn current_wave_worker_buffer_mut(&mut self) -> Option<&mut IterationBuffer> {
+        let idx = self.wave_view_index;
+        self.wave_info_for_view_mut()
+            .and_then(|w| w.worker_buffers.get_mut(idx))
+    }
+}
+
+impl Default for TuiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// IterationBuffer - Content storage for a single iteration
+// ============================================================================
+
+use ratatui::text::Line;
+use std::sync::{Arc, Mutex};
+
+/// Stores formatted output content for a single Ralph iteration.
+/// Each iteration has its own buffer with independent scroll state.
+///
+/// The `lines` field is wrapped in `Arc<Mutex<>>` to allow sharing
+/// with stream handlers during execution, enabling real-time streaming
+/// to the TUI instead of batch transfer after execution completes.
+pub struct IterationBuffer {
+    /// Iteration number (1-indexed for display)
+    pub number: u32,
+    /// Formatted lines of output (shared for streaming)
+    pub lines: Arc<Mutex<Vec<Line<'static>>>>,
+    /// Scroll position within this buffer
+    pub scroll_offset: usize,
+    /// Whether to auto-scroll to bottom as new content arrives.
+    /// Starts true, becomes false when user scrolls up, restored when user
+    /// scrolls to bottom (G key) or manually scrolls down to reach bottom.
+    pub following_bottom: bool,
+    /// Hat display name (emoji + name) for this iteration.
+    pub hat_display: Option<String>,
+    /// Backend used for this iteration (e.g., "claude", "kiro").
+    pub backend: Option<String>,
+    /// When this iteration started (for elapsed time calculation).
+    pub started_at: Option<Instant>,
+    /// Frozen elapsed duration for this iteration (set when completed).
+    pub elapsed: Option<Duration>,
+    /// Wave data associated with this iteration (stored on wave completion).
+    pub wave_info: Option<WaveInfo>,
+}
+
+impl IterationBuffer {
+    /// Creates a new buffer for the given iteration number.
+    pub fn new(number: u32) -> Self {
+        Self {
+            number,
+            lines: Arc::new(Mutex::new(Vec::new())),
+            scroll_offset: 0,
+            following_bottom: true, // Start following bottom for auto-scroll
+            hat_display: None,
+            backend: None,
+            started_at: None,
+            elapsed: None,
+            wave_info: None,
+        }
+    }
+
+    /// Returns a shared handle to the lines buffer for streaming.
+    ///
+    /// This allows stream handlers to write directly to the buffer,
+    /// enabling real-time streaming to the TUI.
+    pub fn lines_handle(&self) -> Arc<Mutex<Vec<Line<'static>>>> {
+        Arc::clone(&self.lines)
+    }
+
+    /// Appends a line to the buffer.
+    pub fn append_line(&mut self, line: Line<'static>) {
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.push(line);
+        }
+    }
+
+    /// Returns the total number of lines in the buffer.
+    pub fn line_count(&self) -> usize {
+        self.lines.lock().map(|l| l.len()).unwrap_or(0)
+    }
+
+    /// Returns a clone of the visible lines based on scroll offset and viewport height.
+    ///
+    /// Note: Returns owned Vec instead of slice due to interior mutability.
+    pub fn visible_lines(&self, viewport_height: usize) -> Vec<Line<'static>> {
+        let Ok(lines) = self.lines.lock() else {
+            return Vec::new();
+        };
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        let start = self.scroll_offset.min(lines.len());
+        let end = (start + viewport_height).min(lines.len());
+        lines[start..end].to_vec()
+    }
+
+    /// Scrolls up by one line.
+    /// Disables auto-scroll since user is moving away from bottom.
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        self.following_bottom = false;
+    }
+
+    /// Scrolls down by one line, respecting the viewport bounds.
+    /// Re-enables auto-scroll if user reaches the bottom.
+    pub fn scroll_down(&mut self, viewport_height: usize) {
+        let max_scroll = self.max_scroll_offset(viewport_height);
+        if self.scroll_offset < max_scroll {
+            self.scroll_offset += 1;
+        }
+        // Re-enable following if user scrolled to or past the bottom
+        if self.scroll_offset >= max_scroll {
+            self.following_bottom = true;
+        }
+    }
+
+    /// Scrolls to the top of the buffer.
+    /// Disables auto-scroll since user is moving away from bottom.
+    pub fn scroll_top(&mut self) {
+        self.scroll_offset = 0;
+        self.following_bottom = false;
+    }
+
+    /// Scrolls to the bottom of the buffer.
+    /// Re-enables auto-scroll since user explicitly went to bottom.
+    pub fn scroll_bottom(&mut self, viewport_height: usize) {
+        self.scroll_offset = self.max_scroll_offset(viewport_height);
+        self.following_bottom = true;
+    }
+
+    /// Calculates the maximum scroll offset for the given viewport height.
+    fn max_scroll_offset(&self, viewport_height: usize) -> usize {
+        self.lines
+            .lock()
+            .map(|l| l.len().saturating_sub(viewport_height))
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // IterationBuffer Tests
+    // ========================================================================
+
+    mod iteration_buffer {
+        use super::*;
+        use ratatui::text::Line;
+
+        #[test]
+        fn new_creates_buffer_with_correct_initial_state() {
+            let buffer = IterationBuffer::new(1);
+            assert_eq!(buffer.number, 1);
+            assert_eq!(buffer.line_count(), 0);
+            assert_eq!(buffer.scroll_offset, 0);
+        }
+
+        #[test]
+        fn append_line_adds_lines_in_order() {
+            let mut buffer = IterationBuffer::new(1);
+            buffer.append_line(Line::from("first"));
+            buffer.append_line(Line::from("second"));
+            buffer.append_line(Line::from("third"));
+
+            assert_eq!(buffer.line_count(), 3);
+            // Verify order by checking raw content
+            let lines = buffer.lines.lock().unwrap();
+            assert_eq!(lines[0].spans[0].content, "first");
+            assert_eq!(lines[1].spans[0].content, "second");
+            assert_eq!(lines[2].spans[0].content, "third");
+        }
+
+        #[test]
+        fn line_count_returns_correct_count() {
+            let mut buffer = IterationBuffer::new(1);
+            assert_eq!(buffer.line_count(), 0);
+
+            for i in 0..10 {
+                buffer.append_line(Line::from(format!("line {}", i)));
+            }
+            assert_eq!(buffer.line_count(), 10);
+        }
+
+        #[test]
+        fn visible_lines_returns_correct_slice_without_scroll() {
+            let mut buffer = IterationBuffer::new(1);
+            for i in 0..10 {
+                buffer.append_line(Line::from(format!("line {}", i)));
+            }
+
+            let visible = buffer.visible_lines(5);
+            assert_eq!(visible.len(), 5);
+            // Should be lines 0-4
+            assert_eq!(visible[0].spans[0].content, "line 0");
+            assert_eq!(visible[4].spans[0].content, "line 4");
+        }
+
+        #[test]
+        fn visible_lines_returns_correct_slice_with_scroll() {
+            let mut buffer = IterationBuffer::new(1);
+            for i in 0..10 {
+                buffer.append_line(Line::from(format!("line {}", i)));
+            }
+            buffer.scroll_offset = 3;
+
+            let visible = buffer.visible_lines(5);
+            assert_eq!(visible.len(), 5);
+            // Should be lines 3-7
+            assert_eq!(visible[0].spans[0].content, "line 3");
+            assert_eq!(visible[4].spans[0].content, "line 7");
+        }
+
+        #[test]
+        fn visible_lines_handles_viewport_larger_than_content() {
+            let mut buffer = IterationBuffer::new(1);
+            for i in 0..3 {
+                buffer.append_line(Line::from(format!("line {}", i)));
+            }
+
+            let visible = buffer.visible_lines(10);
+            assert_eq!(visible.len(), 3); // Only 3 lines exist
+        }
+
+        #[test]
+        fn visible_lines_handles_empty_buffer() {
+            let buffer = IterationBuffer::new(1);
+            let visible = buffer.visible_lines(5);
+            assert!(visible.is_empty());
+        }
+
+        #[test]
+        fn scroll_down_increases_offset() {
+            let mut buffer = IterationBuffer::new(1);
+            for i in 0..10 {
+                buffer.append_line(Line::from(format!("line {}", i)));
+            }
+
+            assert_eq!(buffer.scroll_offset, 0);
+            buffer.scroll_down(5); // viewport height 5
+            assert_eq!(buffer.scroll_offset, 1);
+            buffer.scroll_down(5);
+            assert_eq!(buffer.scroll_offset, 2);
+        }
+
+        #[test]
+        fn scroll_up_decreases_offset() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            buffer.scroll_offset = 5;
+
+            buffer.scroll_up();
+            assert_eq!(buffer.scroll_offset, 4);
+            buffer.scroll_up();
+            assert_eq!(buffer.scroll_offset, 3);
+        }
+
+        #[test]
+        fn scroll_up_does_not_underflow() {
+            let mut buffer = IterationBuffer::new(1);
+            buffer.append_line(Line::from("line"));
+            buffer.scroll_offset = 0;
+
+            buffer.scroll_up();
+            assert_eq!(buffer.scroll_offset, 0); // Should stay at 0
+        }
+
+        #[test]
+        fn scroll_down_does_not_overflow() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            // With 10 lines and viewport 5, max scroll is 5 (shows lines 5-9)
+            buffer.scroll_offset = 5;
+
+            buffer.scroll_down(5);
+            assert_eq!(buffer.scroll_offset, 5); // Should stay at max
+        }
+
+        #[test]
+        fn scroll_top_resets_to_zero() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            buffer.scroll_offset = 5;
+
+            buffer.scroll_top();
+            assert_eq!(buffer.scroll_offset, 0);
+        }
+
+        #[test]
+        fn scroll_bottom_sets_to_max() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+
+            buffer.scroll_bottom(5); // viewport height 5
+            assert_eq!(buffer.scroll_offset, 5); // max = 10 - 5 = 5
+        }
+
+        #[test]
+        fn scroll_bottom_handles_small_content() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..3 {
+                buffer.append_line(Line::from("line"));
+            }
+
+            buffer.scroll_bottom(5); // viewport larger than content
+            assert_eq!(buffer.scroll_offset, 0); // Can't scroll
+        }
+
+        #[test]
+        fn scroll_down_handles_empty_buffer() {
+            let mut buffer = IterationBuffer::new(1);
+            buffer.scroll_down(5);
+            assert_eq!(buffer.scroll_offset, 0);
+        }
+
+        // =====================================================================
+        // Auto-scroll (following_bottom) Tests
+        // =====================================================================
+
+        #[test]
+        fn following_bottom_is_true_initially() {
+            let buffer = IterationBuffer::new(1);
+            assert!(
+                buffer.following_bottom,
+                "New buffer should start with following_bottom = true"
+            );
+        }
+
+        #[test]
+        fn scroll_up_disables_following_bottom() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            buffer.scroll_offset = 5;
+            assert!(buffer.following_bottom);
+
+            buffer.scroll_up();
+
+            assert!(
+                !buffer.following_bottom,
+                "scroll_up should disable following_bottom"
+            );
+        }
+
+        #[test]
+        fn scroll_top_disables_following_bottom() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            assert!(buffer.following_bottom);
+
+            buffer.scroll_top();
+
+            assert!(
+                !buffer.following_bottom,
+                "scroll_top should disable following_bottom"
+            );
+        }
+
+        #[test]
+        fn scroll_bottom_enables_following_bottom() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            buffer.following_bottom = false;
+
+            buffer.scroll_bottom(5);
+
+            assert!(
+                buffer.following_bottom,
+                "scroll_bottom should enable following_bottom"
+            );
+        }
+
+        #[test]
+        fn scroll_down_to_bottom_enables_following_bottom() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            buffer.scroll_offset = 4; // One away from max (5 with viewport 5)
+            buffer.following_bottom = false;
+
+            buffer.scroll_down(5); // Now at max (5)
+
+            assert!(
+                buffer.following_bottom,
+                "scroll_down to bottom should enable following_bottom"
+            );
+        }
+
+        #[test]
+        fn scroll_down_not_at_bottom_keeps_following_false() {
+            let mut buffer = IterationBuffer::new(1);
+            for _ in 0..10 {
+                buffer.append_line(Line::from("line"));
+            }
+            buffer.scroll_offset = 0;
+            buffer.following_bottom = false;
+
+            buffer.scroll_down(5); // Now at 1, max is 5
+
+            assert!(
+                !buffer.following_bottom,
+                "scroll_down not reaching bottom should keep following_bottom false"
+            );
+        }
+
+        #[test]
+        fn autoscroll_scenario_content_grows_past_viewport() {
+            // This tests the core bug fix: content growing from small to large
+            let mut buffer = IterationBuffer::new(1);
+
+            // Start with small content that fits in viewport
+            for _ in 0..5 {
+                buffer.append_line(Line::from("line"));
+            }
+
+            // Simulate initial state: following_bottom = true, scroll_offset = 0
+            let viewport = 20;
+            assert!(buffer.following_bottom);
+            assert_eq!(buffer.scroll_offset, 0);
+
+            // Simulate auto-scroll logic: if following_bottom, scroll to bottom
+            if buffer.following_bottom {
+                let max_scroll = buffer.line_count().saturating_sub(viewport);
+                buffer.scroll_offset = max_scroll;
+            }
+            assert_eq!(buffer.scroll_offset, 0); // max_scroll is 0 when content < viewport
+
+            // Content grows past viewport size
+            for _ in 0..25 {
+                buffer.append_line(Line::from("more content"));
+            }
+            // Now we have 30 lines, viewport is 20, max_scroll = 10
+
+            // The bug was: scroll_offset = 0, but old logic checked if 0 >= 10-1 (false)
+            // With following_bottom flag, we just check the flag:
+            if buffer.following_bottom {
+                let max_scroll = buffer.line_count().saturating_sub(viewport);
+                buffer.scroll_offset = max_scroll;
+            }
+
+            // Now scroll_offset should be at the bottom
+            assert_eq!(
+                buffer.scroll_offset, 10,
+                "Auto-scroll should move to bottom when content grows past viewport"
+            );
+        }
+    }
+
+    // ========================================================================
+    // TuiState Tests (existing)
+    // ========================================================================
+
+    #[test]
+    fn iteration_changed_detects_boundary() {
+        let mut state = TuiState::new();
+        assert!(!state.iteration_changed(), "no change at start");
+
+        // Simulate build.done event (increments iteration)
+        let event = Event::new("build.done", "");
+        state.update(&event);
+
+        assert_eq!(state.iteration, 1);
+        assert_eq!(state.prev_iteration, 0);
+        assert!(state.iteration_changed(), "should detect iteration change");
+    }
+
+    #[test]
+    fn iteration_changed_resets_after_check() {
+        let mut state = TuiState::new();
+        let event = Event::new("build.done", "");
+        state.update(&event);
+
+        assert!(state.iteration_changed());
+
+        // Simulate clearing the flag (app.rs does this by updating prev_iteration)
+        state.prev_iteration = state.iteration;
+        assert!(!state.iteration_changed(), "flag should reset");
+    }
+
+    #[test]
+    fn multiple_iterations_tracked() {
+        let mut state = TuiState::new();
+
+        for i in 1..=3 {
+            let event = Event::new("build.done", "");
+            state.update(&event);
+            assert_eq!(state.iteration, i);
+            assert!(state.iteration_changed());
+            state.prev_iteration = state.iteration; // simulate app clearing flag
+        }
+    }
+
+    #[test]
+    fn custom_hat_topics_update_pending_hat() {
+        // Test that custom hat topics (not hardcoded) update pending_hat correctly
+        use std::collections::HashMap;
+
+        // Create a hat map for custom hats
+        let mut hat_map = HashMap::new();
+        hat_map.insert(
+            "review.security".to_string(),
+            (
+                HatId::new("security_reviewer"),
+                "🔒 Security Reviewer".to_string(),
+            ),
+        );
+        hat_map.insert(
+            "review.correctness".to_string(),
+            (
+                HatId::new("correctness_reviewer"),
+                "🎯 Correctness Reviewer".to_string(),
+            ),
+        );
+
+        let mut state = TuiState::with_hat_map(hat_map);
+
+        // Publish review.security event
+        let event = Event::new("review.security", "Review PR #123");
+        state.update(&event);
+
+        // Should update pending_hat to security reviewer
+        assert_eq!(
+            state.get_pending_hat_display(),
+            "🔒 Security Reviewer",
+            "Should display security reviewer hat for review.security topic"
+        );
+
+        // Publish review.correctness event
+        let event = Event::new("review.correctness", "Check logic");
+        state.update(&event);
+
+        // Should update to correctness reviewer
+        assert_eq!(
+            state.get_pending_hat_display(),
+            "🎯 Correctness Reviewer",
+            "Should display correctness reviewer hat for review.correctness topic"
+        );
+    }
+
+    #[test]
+    fn unknown_topics_keep_pending_hat_unchanged() {
+        // Test that unknown topics don't clear pending_hat
+        let mut state = TuiState::new();
+
+        // Set initial hat
+        state.pending_hat = Some((HatId::new("planner"), "📋Planner".to_string()));
+
+        // Publish unknown event
+        let event = Event::new("unknown.topic", "Some payload");
+        state.update(&event);
+
+        // Should keep the planner hat
+        assert_eq!(
+            state.get_pending_hat_display(),
+            "📋Planner",
+            "Unknown topics should not clear pending_hat"
+        );
+    }
+
+    #[test]
+    fn task_start_preserves_iterations_across_reset() {
+        // Regression test: task.start used to do *self = Self::new() which wiped
+        // iteration buffers, causing the header to show "iter 1/0" and losing all
+        // previous iteration output.
+        let mut state = TuiState::new();
+
+        // Create 3 iterations with content
+        state.start_new_iteration();
+        state.start_new_iteration();
+        state.start_new_iteration();
+        assert_eq!(state.total_iterations(), 3);
+        assert_eq!(state.current_view, 2); // following latest
+
+        // Navigate back to review history
+        state.navigate_prev();
+        assert_eq!(state.current_view, 1);
+        assert!(!state.following_latest);
+
+        // When task.start fires (e.g., new task planning session)
+        let event = Event::new("task.start", "New task");
+        state.update(&event);
+
+        // Then iterations are preserved
+        assert_eq!(
+            state.total_iterations(),
+            3,
+            "task.start should not wipe iteration buffers"
+        );
+        assert_eq!(
+            state.current_view, 1,
+            "task.start should preserve current_view position"
+        );
+        assert!(
+            !state.following_latest,
+            "task.start should preserve following_latest state"
+        );
+    }
+
+    #[test]
+    fn loop_terminate_freezes_iteration_timer() {
+        // Given a running iteration with elapsed time
+        let mut state = TuiState::new();
+        let start_event = Event::new("build.task", "");
+        state.update(&start_event);
+
+        // Verify timer is running
+        assert!(state.iteration_started.is_some());
+        let elapsed_before = state.get_iteration_elapsed().unwrap();
+        assert!(elapsed_before.as_nanos() > 0);
+
+        // When loop.terminate is received
+        let terminate_event = Event::new("loop.terminate", "");
+        state.update(&terminate_event);
+
+        // Then the timer is frozen
+        assert!(state.loop_completed);
+        assert!(state.final_iteration_elapsed.is_some());
+
+        // The elapsed time should be frozen (not increasing)
+        let frozen_elapsed = state.get_iteration_elapsed().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let elapsed_after_sleep = state.get_iteration_elapsed().unwrap();
+
+        assert_eq!(
+            frozen_elapsed, elapsed_after_sleep,
+            "Timer should be frozen after loop.terminate"
+        );
+    }
+
+    #[test]
+    fn loop_terminate_freezes_total_timer() {
+        let mut state = TuiState::new();
+        state.loop_started = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(90))
+                .unwrap(),
+        );
+
+        let before = state.get_loop_elapsed().unwrap();
+        assert!(before.as_secs() >= 90);
+
+        let terminate_event = Event::new("loop.terminate", "");
+        state.update(&terminate_event);
+
+        let frozen = state.get_loop_elapsed().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let after = state.get_loop_elapsed().unwrap();
+
+        assert_eq!(
+            frozen, after,
+            "Loop elapsed time should be frozen after termination"
+        );
+    }
+
+    #[test]
+    fn build_done_freezes_total_timer() {
+        let mut state = TuiState::new();
+        state.loop_started = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(42))
+                .unwrap(),
+        );
+
+        let before = state.get_loop_elapsed().unwrap();
+        assert!(before.as_secs() >= 42);
+
+        let done_event = Event::new("build.done", "");
+        state.update(&done_event);
+
+        let frozen = state.get_loop_elapsed().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let after = state.get_loop_elapsed().unwrap();
+
+        assert_eq!(
+            frozen, after,
+            "Loop elapsed time should be frozen after build.done"
+        );
+    }
+
+    #[test]
+    fn build_blocked_freezes_total_timer() {
+        let mut state = TuiState::new();
+        state.loop_started = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(7))
+                .unwrap(),
+        );
+
+        let before = state.get_loop_elapsed().unwrap();
+        assert!(before.as_secs() >= 7);
+
+        let blocked_event = Event::new("build.blocked", "");
+        state.update(&blocked_event);
+
+        let frozen = state.get_loop_elapsed().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let after = state.get_loop_elapsed().unwrap();
+
+        assert_eq!(
+            frozen, after,
+            "Loop elapsed time should be frozen after build.blocked"
+        );
+    }
+
+    // ========================================================================
+    // TuiState Iteration Management Tests
+    // ========================================================================
+
+    mod tui_state_iterations {
+        use super::*;
+
+        #[test]
+        fn start_new_iteration_creates_first_buffer() {
+            // Given TuiState with 0 iterations
+            let mut state = TuiState::new();
+            assert_eq!(state.total_iterations(), 0);
+
+            // When start_new_iteration() is called
+            state.start_new_iteration();
+
+            // Then iterations.len() == 1 and new IterationBuffer exists
+            assert_eq!(state.total_iterations(), 1);
+            assert_eq!(state.iterations[0].number, 1);
+        }
+
+        #[test]
+        fn start_new_iteration_creates_subsequent_buffers() {
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+
+            assert_eq!(state.total_iterations(), 3);
+            assert_eq!(state.iterations[0].number, 1);
+            assert_eq!(state.iterations[1].number, 2);
+            assert_eq!(state.iterations[2].number, 3);
+        }
+
+        #[test]
+        fn current_iteration_returns_correct_buffer() {
+            // Given TuiState with 3 iterations and current_view = 1
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 1;
+
+            // When current_iteration() is called
+            let current = state.current_iteration();
+
+            // Then the buffer at index 1 is returned (iteration number 2)
+            assert!(current.is_some());
+            assert_eq!(current.unwrap().number, 2);
+        }
+
+        #[test]
+        fn current_iteration_returns_none_when_empty() {
+            let state = TuiState::new();
+            assert!(state.current_iteration().is_none());
+        }
+
+        #[test]
+        fn current_iteration_mut_allows_modification() {
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+
+            // Add a line via mutable reference
+            if let Some(buffer) = state.current_iteration_mut() {
+                buffer.append_line(Line::from("test line"));
+            }
+
+            // Verify modification persisted
+            assert_eq!(state.current_iteration().unwrap().line_count(), 1);
+        }
+
+        #[test]
+        fn navigate_next_increases_current_view() {
+            // Given TuiState with current_view = 1 and 3 iterations
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 1;
+            state.following_latest = false;
+
+            // When navigate_next() is called
+            state.navigate_next();
+
+            // Then current_view == 2
+            assert_eq!(state.current_view, 2);
+        }
+
+        #[test]
+        fn navigate_prev_decreases_current_view() {
+            // Given TuiState with current_view = 2
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 2;
+
+            // When navigate_prev() is called
+            state.navigate_prev();
+
+            // Then current_view == 1
+            assert_eq!(state.current_view, 1);
+        }
+
+        #[test]
+        fn navigate_next_does_not_exceed_bounds() {
+            // Given TuiState with current_view = 2 and 3 iterations (max index 2)
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 2;
+
+            // When navigate_next() is called
+            state.navigate_next();
+
+            // Then current_view stays at 2
+            assert_eq!(state.current_view, 2);
+        }
+
+        #[test]
+        fn navigate_prev_does_not_go_below_zero() {
+            // Given TuiState with current_view = 0
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.current_view = 0;
+
+            // When navigate_prev() is called
+            state.navigate_prev();
+
+            // Then current_view stays at 0
+            assert_eq!(state.current_view, 0);
+        }
+
+        #[test]
+        fn following_latest_initially_true() {
+            // Given new TuiState
+            // When created
+            let state = TuiState::new();
+
+            // Then following_latest == true
+            assert!(state.following_latest);
+        }
+
+        #[test]
+        fn following_latest_becomes_false_on_back_navigation() {
+            // Given TuiState with following_latest = true and current_view = 2
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 2;
+            state.following_latest = true;
+
+            // When navigate_prev() is called
+            state.navigate_prev();
+
+            // Then following_latest == false
+            assert!(!state.following_latest);
+        }
+
+        #[test]
+        fn following_latest_restored_at_latest() {
+            // Given TuiState with following_latest = false
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 1;
+            state.following_latest = false;
+
+            // When navigate_next() reaches the last iteration
+            state.navigate_next(); // 1 -> 2 (last)
+
+            // Then following_latest == true
+            assert!(state.following_latest);
+        }
+
+        #[test]
+        fn total_iterations_reports_count() {
+            // Given TuiState with 3 iterations
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+
+            // When total_iterations() is called
+            // Then 3 is returned
+            assert_eq!(state.total_iterations(), 3);
+        }
+
+        #[test]
+        fn start_new_iteration_auto_follows_latest() {
+            let mut state = TuiState::new();
+            state.following_latest = true;
+            state.start_new_iteration();
+            state.start_new_iteration();
+
+            // When following latest, current_view should track new iterations
+            assert_eq!(state.current_view, 1); // Index of second iteration
+        }
+
+        // ========================================================================
+        // Per-Iteration Scroll Independence Tests (Task 08)
+        // ========================================================================
+
+        #[test]
+        fn per_iteration_scroll_independence() {
+            // Given iteration 1 with scroll_offset 5 and iteration 2 with scroll_offset 0
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+
+            // Set different scroll offsets for each iteration
+            state.iterations[0].scroll_offset = 5;
+            state.iterations[1].scroll_offset = 0;
+
+            // When switching between iterations
+            state.current_view = 0;
+            assert_eq!(
+                state.current_iteration().unwrap().scroll_offset,
+                5,
+                "iteration 1 should have scroll_offset 5"
+            );
+
+            state.navigate_next();
+            assert_eq!(
+                state.current_iteration().unwrap().scroll_offset,
+                0,
+                "iteration 2 should have scroll_offset 0"
+            );
+
+            // Then each iteration's scroll_offset is preserved
+            state.navigate_prev();
+            assert_eq!(
+                state.current_iteration().unwrap().scroll_offset,
+                5,
+                "iteration 1 should still have scroll_offset 5 after switching back"
+            );
+        }
+
+        #[test]
+        fn scroll_within_iteration_does_not_affect_others() {
+            // Given multiple iterations with different scroll offsets
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+
+            // Add content to each iteration
+            for i in 0..3 {
+                for j in 0..20 {
+                    state.iterations[i].append_line(Line::from(format!(
+                        "iter {} line {}",
+                        i + 1,
+                        j
+                    )));
+                }
+            }
+
+            // Set initial scroll offsets
+            state.iterations[0].scroll_offset = 3;
+            state.iterations[1].scroll_offset = 7;
+            state.iterations[2].scroll_offset = 10;
+
+            // When scrolling in iteration 2
+            state.current_view = 1;
+            state.current_iteration_mut().unwrap().scroll_down(10);
+
+            // Then only iteration 2's scroll changed
+            assert_eq!(
+                state.iterations[0].scroll_offset, 3,
+                "iteration 1 unchanged"
+            );
+            assert_eq!(
+                state.iterations[1].scroll_offset, 8,
+                "iteration 2 scrolled down"
+            );
+            assert_eq!(
+                state.iterations[2].scroll_offset, 10,
+                "iteration 3 unchanged"
+            );
+        }
+
+        // ========================================================================
+        // New Iteration Alert Tests (Task 07)
+        // ========================================================================
+
+        #[test]
+        fn new_iteration_alert_set_when_not_following() {
+            // Given following_latest = false and new iteration arrives
+            let mut state = TuiState::new();
+            state.start_new_iteration(); // Iteration 1
+            state.start_new_iteration(); // Iteration 2
+            state.navigate_prev(); // Go back to iteration 1, following_latest = false
+
+            // When start_new_iteration() is called
+            state.start_new_iteration(); // Iteration 3
+
+            // Then new_iteration_alert is set to the new iteration number
+            assert_eq!(state.new_iteration_alert, Some(3));
+        }
+
+        #[test]
+        fn new_iteration_alert_not_set_when_following() {
+            // Given following_latest = true
+            let mut state = TuiState::new();
+            state.following_latest = true;
+            state.start_new_iteration();
+
+            // When start_new_iteration() is called
+            state.start_new_iteration();
+
+            // Then new_iteration_alert remains None
+            assert_eq!(state.new_iteration_alert, None);
+        }
+
+        #[test]
+        fn alert_cleared_when_following_restored() {
+            // Given new_iteration_alert = Some(5)
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 0;
+            state.following_latest = false;
+            state.new_iteration_alert = Some(3);
+
+            // When navigation restores following_latest = true
+            state.navigate_next(); // 0 -> 1
+            state.navigate_next(); // 1 -> 2 (last, restores following)
+
+            // Then new_iteration_alert is cleared to None
+            assert_eq!(state.new_iteration_alert, None);
+        }
+
+        #[test]
+        fn alert_not_cleared_on_partial_navigation() {
+            // Given new_iteration_alert = Some(3) and not at last iteration
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.start_new_iteration();
+            state.current_view = 0;
+            state.following_latest = false;
+            state.new_iteration_alert = Some(3);
+
+            // When navigate_next() but not reaching last
+            state.navigate_next(); // 0 -> 1
+
+            // Then alert is still set (not at latest yet)
+            assert_eq!(state.new_iteration_alert, Some(3));
+            assert!(!state.following_latest);
+        }
+
+        #[test]
+        fn alert_updates_for_multiple_new_iterations() {
+            // Given not following and multiple new iterations arrive
+            let mut state = TuiState::new();
+            state.start_new_iteration(); // 1
+            state.start_new_iteration(); // 2
+            state.navigate_prev(); // Go back, stop following
+
+            state.start_new_iteration(); // 3 arrives
+            assert_eq!(state.new_iteration_alert, Some(3));
+
+            // When another iteration arrives
+            state.start_new_iteration(); // 4 arrives
+
+            // Then alert should show the newest
+            assert_eq!(state.new_iteration_alert, Some(4));
+        }
+    }
+
+    // ========================================================================
+    // SearchState Tests (Task 09)
+    // ========================================================================
+
+    mod search_state {
+        use super::*;
+
+        #[test]
+        fn search_finds_matches_in_lines() {
+            // Given current iteration with "error" in 3 lines
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            buffer.append_line(Line::from("First error occurred"));
+            buffer.append_line(Line::from("Normal line"));
+            buffer.append_line(Line::from("Another error here"));
+            buffer.append_line(Line::from("Final error message"));
+
+            // When search("error") is called
+            state.search("error");
+
+            // Then matches.len() >= 3
+            assert!(
+                state.search_state.matches.len() >= 3,
+                "expected at least 3 matches, got {}",
+                state.search_state.matches.len()
+            );
+            assert_eq!(state.search_state.query, Some("error".to_string()));
+        }
+
+        #[test]
+        fn search_is_case_insensitive() {
+            // Given current iteration with "Error" and "error"
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            buffer.append_line(Line::from("Error in uppercase"));
+            buffer.append_line(Line::from("error in lowercase"));
+            buffer.append_line(Line::from("ERROR all caps"));
+
+            // When search("error") is called
+            state.search("error");
+
+            // Then all 3 are found
+            assert_eq!(
+                state.search_state.matches.len(),
+                3,
+                "expected 3 case-insensitive matches"
+            );
+        }
+
+        #[test]
+        fn next_match_cycles_forward() {
+            // Given 3 matches and current_match = 2 (last)
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            buffer.append_line(Line::from("match one"));
+            buffer.append_line(Line::from("match two"));
+            buffer.append_line(Line::from("match three"));
+            state.search("match");
+            state.search_state.current_match = 2;
+
+            // When next_match() is called
+            state.next_match();
+
+            // Then current_match becomes 0 (cycles back)
+            assert_eq!(state.search_state.current_match, 0);
+        }
+
+        #[test]
+        fn prev_match_cycles_backward() {
+            // Given 3 matches and current_match = 0 (first)
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            buffer.append_line(Line::from("match one"));
+            buffer.append_line(Line::from("match two"));
+            buffer.append_line(Line::from("match three"));
+            state.search("match");
+            state.search_state.current_match = 0;
+
+            // When prev_match() is called
+            state.prev_match();
+
+            // Then current_match becomes 2 (cycles back)
+            assert_eq!(state.search_state.current_match, 2);
+        }
+
+        #[test]
+        fn search_jumps_to_match_line() {
+            // Given match at line 50
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            for i in 0..60 {
+                if i == 50 {
+                    buffer.append_line(Line::from("target match here"));
+                } else {
+                    buffer.append_line(Line::from(format!("line {}", i)));
+                }
+            }
+
+            // When search finds match at line 50
+            state.search("target");
+
+            // Then scroll_offset is updated so line 50 is visible
+            let buffer = state.current_iteration().unwrap();
+            // With viewport of ~20, scroll should position line 50 in view
+            assert!(
+                buffer.scroll_offset <= 50,
+                "scroll_offset {} should position line 50 in view",
+                buffer.scroll_offset
+            );
+        }
+
+        #[test]
+        fn clear_search_resets_state() {
+            // Given active search
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            buffer.append_line(Line::from("search term here"));
+            state.search("term");
+            assert!(state.search_state.query.is_some());
+
+            // When clear_search() is called
+            state.clear_search();
+
+            // Then query = None, matches cleared, search_mode = false
+            assert!(state.search_state.query.is_none());
+            assert!(state.search_state.matches.is_empty());
+            assert!(!state.search_state.search_mode);
+        }
+
+        #[test]
+        fn search_with_no_matches_sets_empty() {
+            // Given iteration with no matching content
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            buffer.append_line(Line::from("hello world"));
+
+            // When searching for non-existent term
+            state.search("xyz");
+
+            // Then matches is empty but query is set
+            assert_eq!(state.search_state.query, Some("xyz".to_string()));
+            assert!(state.search_state.matches.is_empty());
+            assert_eq!(state.search_state.current_match, 0);
+        }
+
+        #[test]
+        fn search_on_empty_iteration_handles_gracefully() {
+            // Given empty iteration
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+
+            // When searching
+            state.search("anything");
+
+            // Then no panic, empty matches
+            assert!(state.search_state.matches.is_empty());
+        }
+
+        #[test]
+        fn next_match_with_no_matches_does_nothing() {
+            // Given no active search or empty matches
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+
+            // When next_match is called
+            state.next_match();
+
+            // Then no panic, current_match stays 0
+            assert_eq!(state.search_state.current_match, 0);
+        }
+
+        #[test]
+        fn multiple_matches_on_same_line() {
+            // Given line with multiple occurrences
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            buffer.append_line(Line::from("error error error"));
+
+            // When searching
+            state.search("error");
+
+            // Then finds all 3 matches
+            assert_eq!(
+                state.search_state.matches.len(),
+                3,
+                "should find 3 matches on same line"
+            );
+        }
+
+        #[test]
+        fn next_match_updates_scroll_to_show_match() {
+            // Given many lines with matches spread out
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+            let buffer = state.current_iteration_mut().unwrap();
+            for i in 0..100 {
+                if i % 30 == 0 {
+                    buffer.append_line(Line::from("findme"));
+                } else {
+                    buffer.append_line(Line::from(format!("line {}", i)));
+                }
+            }
+            state.search("findme");
+
+            // Navigate to second match (at line 30)
+            state.next_match();
+
+            // Then scroll should position line 30 in view
+            let buffer = state.current_iteration().unwrap();
+            // Match at line 30, scroll should be adjusted
+            assert!(buffer.scroll_offset <= 30, "scroll should show line 30");
+        }
+
+        #[test]
+        fn latest_iteration_lines_handle_returns_newest_iteration() {
+            // Given a user viewing iteration 1 while iteration 3 is executing
+            let mut state = TuiState::new();
+            state.start_new_iteration(); // iteration 1
+            state.start_new_iteration(); // iteration 2
+            state.start_new_iteration(); // iteration 3
+
+            // User navigates back to iteration 1
+            state.current_view = 0;
+            state.following_latest = false;
+
+            // When getting line handles
+            let current_handle = state.current_iteration_lines_handle();
+            let latest_handle = state.latest_iteration_lines_handle();
+
+            // Then current_iteration_lines_handle returns iteration 1's buffer
+            assert!(current_handle.is_some());
+            // And latest_iteration_lines_handle returns iteration 3's buffer
+            assert!(latest_handle.is_some());
+
+            // Write to latest and verify it doesn't affect current view
+            {
+                let latest = latest_handle.unwrap();
+                latest
+                    .lock()
+                    .unwrap()
+                    .push(Line::from("output from iteration 3"));
+            }
+
+            // Current view (iteration 1) should be empty
+            let current = state.current_iteration().unwrap();
+            assert_eq!(
+                current.lines.lock().unwrap().len(),
+                0,
+                "iteration 1 should have no lines"
+            );
+
+            // Latest (iteration 3) should have the output
+            let latest_buffer = state.iterations.last().unwrap();
+            assert_eq!(
+                latest_buffer.lines.lock().unwrap().len(),
+                1,
+                "iteration 3 should have the output"
+            );
+        }
+
+        #[test]
+        fn output_goes_to_correct_iteration_when_user_reviewing_history() {
+            // This reproduces the bug: user is on page 3 of 6, but active agent writes to page 3
+            let mut state = TuiState::new();
+
+            // Create 6 iterations
+            for _ in 0..6 {
+                state.start_new_iteration();
+            }
+
+            // User navigates to iteration 3 (index 2)
+            state.current_view = 2;
+            state.following_latest = false;
+
+            // New iteration starts (iteration 7)
+            state.start_new_iteration();
+
+            // Get handle for writing output - MUST use latest, not current
+            let lines_handle = state.latest_iteration_lines_handle();
+
+            // Write output
+            {
+                let handle = lines_handle.unwrap();
+                handle
+                    .lock()
+                    .unwrap()
+                    .push(Line::from("iteration 7 output"));
+            }
+
+            // Verify: iteration 3 (what user is viewing) should be unaffected
+            let iteration_3 = &state.iterations[2];
+            assert_eq!(
+                iteration_3.lines.lock().unwrap().len(),
+                0,
+                "iteration 3 (being viewed) should have no output"
+            );
+
+            // Verify: iteration 7 (latest) should have the output
+            let iteration_7 = state.iterations.last().unwrap();
+            assert_eq!(
+                iteration_7.lines.lock().unwrap().len(),
+                1,
+                "iteration 7 (latest) should have the output"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Guidance Tests
+    // ========================================================================
+
+    mod guidance {
+        use super::*;
+
+        #[test]
+        fn start_guidance_sets_mode_and_clears_input() {
+            let mut state = TuiState::new();
+            state.guidance_input = "leftover".to_string();
+            state.start_guidance(GuidanceMode::Next);
+            assert_eq!(state.guidance_mode, Some(GuidanceMode::Next));
+            assert!(state.guidance_input.is_empty());
+        }
+
+        #[test]
+        fn start_guidance_now_mode() {
+            let mut state = TuiState::new();
+            state.start_guidance(GuidanceMode::Now);
+            assert_eq!(state.guidance_mode, Some(GuidanceMode::Now));
+        }
+
+        #[test]
+        fn cancel_guidance_clears_state() {
+            let mut state = TuiState::new();
+            state.start_guidance(GuidanceMode::Next);
+            state.guidance_input = "some text".to_string();
+            state.cancel_guidance();
+            assert!(state.guidance_mode.is_none());
+            assert!(state.guidance_input.is_empty());
+        }
+
+        #[test]
+        fn send_guidance_next_pushes_to_queue() {
+            let mut state = TuiState::new();
+            state.start_guidance(GuidanceMode::Next);
+            state.guidance_input = "check auth.rs".to_string();
+            assert!(state.send_guidance());
+            assert!(state.guidance_mode.is_none());
+            assert!(state.guidance_input.is_empty());
+
+            let queue = state.guidance_next_queue.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0], "check auth.rs");
+        }
+
+        #[test]
+        fn send_guidance_empty_input_cancels() {
+            let mut state = TuiState::new();
+            state.start_guidance(GuidanceMode::Next);
+            state.guidance_input = "   ".to_string();
+            assert!(!state.send_guidance());
+            let queue = state.guidance_next_queue.lock().unwrap();
+            assert!(queue.is_empty());
+        }
+
+        #[test]
+        fn send_guidance_sets_flash() {
+            let mut state = TuiState::new();
+            state.start_guidance(GuidanceMode::Next);
+            state.guidance_input = "test".to_string();
+            state.send_guidance();
+            assert!(state.guidance_flash.is_some());
+            assert_eq!(
+                state.active_guidance_flash(),
+                Some((GuidanceMode::Next, GuidanceResult::Queued))
+            );
+        }
+
+        #[test]
+        fn send_guidance_now_writes_to_events_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let events_path = dir.path().join("events.jsonl");
+            let urgent_steer_path = dir.path().join("urgent-steer.json");
+
+            let mut state = TuiState::new();
+            state.events_path = Some(events_path.clone());
+            state.urgent_steer_path = Some(urgent_steer_path.clone());
+            state.start_guidance(GuidanceMode::Now);
+            state.guidance_input = "fix the bug now".to_string();
+            assert!(state.send_guidance());
+
+            let content = std::fs::read_to_string(&events_path).unwrap();
+            let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+            assert_eq!(event["topic"], "human.guidance");
+            assert_eq!(event["payload"], "fix the bug now");
+            assert!(event["ts"].is_string());
+
+            let steer = ralph_core::UrgentSteerStore::new(urgent_steer_path)
+                .load()
+                .unwrap()
+                .expect("urgent steer");
+            assert_eq!(steer.messages, vec!["fix the bug now"]);
+        }
+
+        #[test]
+        fn send_guidance_now_without_events_path_fails() {
+            let mut state = TuiState::new();
+            state.events_path = None;
+            state.start_guidance(GuidanceMode::Now);
+            state.guidance_input = "test".to_string();
+            assert!(!state.send_guidance());
+        }
+
+        #[test]
+        fn is_guidance_active_reflects_mode() {
+            let mut state = TuiState::new();
+            assert!(!state.is_guidance_active());
+            state.start_guidance(GuidanceMode::Next);
+            assert!(state.is_guidance_active());
+            state.cancel_guidance();
+            assert!(!state.is_guidance_active());
+        }
+
+        #[test]
+        fn multiple_guidance_messages_queue_correctly() {
+            let mut state = TuiState::new();
+
+            state.start_guidance(GuidanceMode::Next);
+            state.guidance_input = "first".to_string();
+            state.send_guidance();
+
+            state.start_guidance(GuidanceMode::Next);
+            state.guidance_input = "second".to_string();
+            state.send_guidance();
+
+            let queue = state.guidance_next_queue.lock().unwrap();
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue[0], "first");
+            assert_eq!(queue[1], "second");
+        }
+
+        #[test]
+        fn task_start_preserves_guidance_queue() {
+            let mut state = TuiState::new();
+            state.start_new_iteration();
+
+            // Queue some guidance
+            state.start_guidance(GuidanceMode::Next);
+            state.guidance_input = "remember this".to_string();
+            state.send_guidance();
+
+            // Simulate task.start reset
+            let event = Event::new("task.start", "New task");
+            state.update(&event);
+
+            // Queue should be preserved (same Arc)
+            let queue = state.guidance_next_queue.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0], "remember this");
+        }
+    }
+
+    // ========================================================================
+    // Wave View Per-Iteration Tests
+    // ========================================================================
+
+    mod wave_view {
+        use super::*;
+
+        /// Simulates wave lifecycle: start a wave on the given state,
+        /// then complete it, storing the data on the correct iteration.
+        fn simulate_wave(state: &mut TuiState, worker_count: u32) {
+            let iter_idx = state.iterations.len().saturating_sub(1);
+            state.wave_active = Some(WaveInfo::new("TestHat".to_string(), worker_count));
+            state.wave_active_iteration_idx = Some(iter_idx);
+            // Add some content to worker buffers
+            if let Some(ref wave) = state.wave_active {
+                for (i, buf) in wave.worker_buffers.iter().enumerate() {
+                    let handle = buf.lines_handle();
+                    if let Ok(mut lines) = handle.lock() {
+                        lines.push(Line::from(format!("Worker {} output", i + 1)));
+                    }
+                }
+            }
+            // Complete the wave — move to iteration buffer
+            let wave_iter_idx = state.wave_active_iteration_idx.take();
+            if let Some(wave) = state.wave_active.take() {
+                let target = wave_iter_idx.unwrap_or(0);
+                if let Some(buf) = state.iterations.get_mut(target) {
+                    buf.wave_info = Some(wave);
+                }
+            }
+        }
+
+        #[test]
+        fn wave_view_shows_correct_wave_for_historical_iteration() {
+            let mut state = TuiState::new();
+
+            // Iteration 1: wave with 5 workers
+            state.start_new_iteration();
+            simulate_wave(&mut state, 5);
+
+            // Iteration 2: wave with 3 workers
+            state.start_new_iteration();
+            simulate_wave(&mut state, 3);
+
+            // Navigate to iteration 1
+            state.navigate_prev();
+            assert_eq!(state.current_view, 0);
+
+            // Press 'w' — should show iteration 1's wave (5 workers)
+            state.enter_wave_view();
+            assert!(state.wave_view_active);
+
+            let wave = state.wave_info_for_wave_view().unwrap();
+            assert_eq!(
+                wave.total, 5,
+                "Should show 5 workers from iteration 1, not 3"
+            );
+            assert_eq!(wave.worker_buffers.len(), 5);
+        }
+
+        #[test]
+        fn wave_view_shows_active_wave_on_current_iteration() {
+            let mut state = TuiState::new();
+
+            // Iteration 1: completed wave with 5 workers
+            state.start_new_iteration();
+            simulate_wave(&mut state, 5);
+
+            // Iteration 2: active wave with 3 workers (not completed)
+            state.start_new_iteration();
+            state.wave_active = Some(WaveInfo::new("ActiveHat".to_string(), 3));
+            state.wave_active_iteration_idx = Some(1);
+
+            // Viewing iteration 2 (latest) — should see active wave
+            assert_eq!(state.current_view, 1);
+            state.enter_wave_view();
+            assert!(state.wave_view_active);
+
+            let wave = state.wave_info_for_wave_view().unwrap();
+            assert_eq!(wave.total, 3, "Should show active wave's 3 workers");
+        }
+
+        #[test]
+        fn wave_view_ignores_active_wave_when_viewing_historical() {
+            let mut state = TuiState::new();
+
+            // Iteration 1: completed wave with 5 workers
+            state.start_new_iteration();
+            simulate_wave(&mut state, 5);
+
+            // Iteration 2: active wave with 3 workers (not completed)
+            state.start_new_iteration();
+            state.wave_active = Some(WaveInfo::new("ActiveHat".to_string(), 3));
+            state.wave_active_iteration_idx = Some(1);
+
+            // Navigate back to iteration 1
+            state.navigate_prev();
+            assert_eq!(state.current_view, 0);
+
+            // Press 'w' — should show iteration 1's completed wave, NOT the active wave
+            state.enter_wave_view();
+            assert!(state.wave_view_active);
+
+            let wave = state.wave_info_for_wave_view().unwrap();
+            assert_eq!(
+                wave.total, 5,
+                "Must show historical iteration's 5 workers, not active wave's 3"
+            );
+        }
+
+        #[test]
+        fn wave_view_no_op_on_iteration_without_wave() {
+            let mut state = TuiState::new();
+
+            // Iteration 1: has a wave
+            state.start_new_iteration();
+            simulate_wave(&mut state, 3);
+
+            // Iteration 2: no wave
+            state.start_new_iteration();
+
+            // Viewing iteration 2 — pressing 'w' should be a no-op
+            state.enter_wave_view();
+            assert!(!state.wave_view_active);
+        }
+
+        #[test]
+        fn wave_worker_navigation_uses_correct_wave() {
+            let mut state = TuiState::new();
+
+            // Iteration 1: wave with 5 workers
+            state.start_new_iteration();
+            simulate_wave(&mut state, 5);
+
+            // Iteration 2: wave with 2 workers
+            state.start_new_iteration();
+            simulate_wave(&mut state, 2);
+
+            // Navigate to iteration 1 and enter wave view
+            state.navigate_prev();
+            state.enter_wave_view();
+
+            // Cycle through workers — should wrap at 5, not 2
+            for i in 0..5 {
+                assert_eq!(state.wave_view_index, i);
+                state.wave_view_next();
+            }
+            // After 5 nexts, should wrap back to 0
+            assert_eq!(state.wave_view_index, 0);
+        }
+    }
+}
