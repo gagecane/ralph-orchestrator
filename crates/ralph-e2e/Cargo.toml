@@ -45,8 +45,8 @@ regex.workspace = true
 # Async trait support
 async-trait.workspace = true
 
-# Ralph core for cassette replay
-ralph-core = { path = "../ralph-core", features = ["recording"] }
+# Ralph core for cassette replay (recording feature enabled by workspace default)
+ralph-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -25,7 +25,7 @@ tempfile.workspace = true
 termimad.workspace = true
 
 # ANSI escape code parsing (converts ANSI to ratatui Text)
-ansi-to-tui = "8"
+ansi-to-tui.workspace = true
 
 # TUI (for TuiStreamHandler)
 ratatui.workspace = true

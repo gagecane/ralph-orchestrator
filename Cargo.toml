@@ -123,6 +123,15 @@ tempfile = "3"
 # Terminal markdown rendering
 termimad = "0.31"
 
+# ANSI escape code parsing (converts ANSI to ratatui Text)
+ansi-to-tui = "8"
+
+# URL parsing
+url = "2"
+
+# JSON Schema validation
+jsonschema = { version = "0.18", features = ["draft202012"] }
+
 # Terminal colors
 colored = "3"
 
