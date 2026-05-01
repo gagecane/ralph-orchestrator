@@ -62,6 +62,12 @@ use payload::{
     build_plan_created_payload_input,
 };
 
+mod late_events;
+use late_events::{
+    LateEventRecovery, output_mentions_ralph_emit, recover_expected_emit_after_output,
+    recover_late_events_before_fallback,
+};
+
 /// Outcome of executing a prompt via PTY or CLI executor.
 pub(crate) struct ExecutionOutcome {
     pub output: String,
