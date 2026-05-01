@@ -419,3 +419,535 @@ fn print_human_diagnostic(diagnostic: &HooksDiagnostic, use_colors: bool) {
         println!("       command: {command}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ralph_core::{HookOnError, HookPhaseEvent, HookSpec, RalphConfig};
+    use tempfile::TempDir;
+
+    // ---------- pure helpers ----------
+
+    #[test]
+    fn non_empty_trimmed_returns_none_for_empty_or_whitespace() {
+        assert_eq!(non_empty_trimmed(""), None);
+        assert_eq!(non_empty_trimmed("   "), None);
+        assert_eq!(non_empty_trimmed("\t\n "), None);
+    }
+
+    #[test]
+    fn non_empty_trimmed_returns_trimmed_value() {
+        assert_eq!(non_empty_trimmed("hook"), Some("hook".to_string()));
+        assert_eq!(non_empty_trimmed("  hook  "), Some("hook".to_string()));
+    }
+
+    #[test]
+    fn hook_path_override_prefers_upper_case_path() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert("Path".to_string(), "/ignored".to_string());
+        assert_eq!(hook_path_override(&env), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn hook_path_override_falls_back_to_windows_style_path() {
+        let mut env = HashMap::new();
+        env.insert("Path".to_string(), "C:/bin".to_string());
+        assert_eq!(hook_path_override(&env), Some("C:/bin"));
+    }
+
+    #[test]
+    fn hook_path_override_returns_none_when_absent() {
+        let env: HashMap<String, String> = HashMap::new();
+        assert_eq!(hook_path_override(&env), None);
+    }
+
+    #[test]
+    fn resolve_hook_cwd_uses_workspace_root_when_hook_has_no_cwd() {
+        let workspace = Path::new("/workspace");
+        assert_eq!(resolve_hook_cwd(workspace, None), PathBuf::from("/workspace"));
+    }
+
+    #[test]
+    fn resolve_hook_cwd_joins_relative_cwd_with_workspace() {
+        let workspace = Path::new("/workspace");
+        let resolved = resolve_hook_cwd(workspace, Some(Path::new("scripts")));
+        assert_eq!(resolved, PathBuf::from("/workspace/scripts"));
+    }
+
+    #[test]
+    fn resolve_hook_cwd_uses_absolute_cwd_directly() {
+        let workspace = Path::new("/workspace");
+        let resolved = resolve_hook_cwd(workspace, Some(Path::new("/etc/hook")));
+        assert_eq!(resolved, PathBuf::from("/etc/hook"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_extensions_on_unix_returns_single_empty_string() {
+        let extensions = executable_extensions();
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0], OsString::new());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn executable_extensions_on_windows_returns_pathext() {
+        // Just sanity check that we get something non-empty on Windows.
+        let extensions = executable_extensions();
+        assert!(!extensions.is_empty());
+    }
+
+    #[test]
+    fn count_configured_hooks_is_zero_for_default_config() {
+        let config = RalphConfig::default();
+        assert_eq!(count_configured_hooks(&config), 0);
+    }
+
+    #[test]
+    fn count_configured_hooks_sums_across_events() {
+        let mut config = RalphConfig::default();
+        config.hooks.events.insert(
+            HookPhaseEvent::PreLoopStart,
+            vec![
+                build_hook("a", vec!["true".to_string()]),
+                build_hook("b", vec!["true".to_string()]),
+            ],
+        );
+        config.hooks.events.insert(
+            HookPhaseEvent::PostLoopComplete,
+            vec![build_hook("c", vec!["true".to_string()])],
+        );
+
+        assert_eq!(count_configured_hooks(&config), 3);
+    }
+
+    // ---------- is_executable_file / resolve_hook_command ----------
+
+    #[test]
+    fn is_executable_file_false_for_missing() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("nope");
+        assert!(!is_executable_file(&missing));
+    }
+
+    #[test]
+    fn is_executable_file_false_for_directory() {
+        let temp = TempDir::new().unwrap();
+        assert!(!is_executable_file(temp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_file_requires_exec_bit_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("script.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+
+        // No exec bit yet.
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&script, perms).unwrap();
+        assert!(!is_executable_file(&script));
+
+        // With exec bit.
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        assert!(is_executable_file(&script));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_hook_command_accepts_absolute_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("hook.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved = resolve_hook_command(
+            &script.to_string_lossy(),
+            Path::new("/tmp"),
+            None,
+        )
+        .expect("absolute executable should resolve");
+        assert_eq!(resolved, script);
+    }
+
+    #[test]
+    fn resolve_hook_command_absolute_path_missing_fails() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("nope.sh");
+
+        let err = resolve_hook_command(
+            &missing.to_string_lossy(),
+            Path::new("/tmp"),
+            None,
+        )
+        .expect_err("missing absolute command should fail");
+        assert!(err.contains("does not exist"), "err: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_hook_command_absolute_path_non_executable_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("hook.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = resolve_hook_command(
+            &script.to_string_lossy(),
+            Path::new("/tmp"),
+            None,
+        )
+        .expect_err("non-executable absolute command should fail");
+        assert!(err.contains("not executable"), "err: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_hook_command_relative_resolves_against_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let scripts = temp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script = scripts.join("hook.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved = resolve_hook_command("scripts/hook.sh", temp.path(), None)
+            .expect("relative multi-segment command should resolve against cwd");
+        assert_eq!(resolved, script);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_hook_command_uses_path_override_bin_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cmd = bin.join("mytool");
+        std::fs::write(&cmd, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&cmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path_override = bin.to_string_lossy().to_string();
+        let resolved = resolve_hook_command("mytool", Path::new("/tmp"), Some(&path_override))
+            .expect("command should resolve via PATH override");
+        assert_eq!(resolved, cmd);
+    }
+
+    #[test]
+    fn resolve_hook_command_reports_path_override_source_on_miss() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("empty-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let path_override = bin.to_string_lossy().to_string();
+        let err = resolve_hook_command(
+            "nonexistent-ralph-tool-xyz",
+            Path::new("/tmp"),
+            Some(&path_override),
+        )
+        .expect_err("missing command should fail lookup");
+        assert!(err.contains("hook env PATH"), "err: {err}");
+    }
+
+    // ---------- HooksValidateReport ----------
+
+    #[test]
+    fn report_new_starts_in_passing_state() {
+        let report = HooksValidateReport::new("label".to_string());
+        assert!(report.pass);
+        assert_eq!(report.source, "label");
+        assert!(!report.hooks_enabled);
+        assert_eq!(report.checked_hooks, 0);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn push_diagnostic_flips_pass_and_records_details() {
+        let mut report = HooksValidateReport::new("label".to_string());
+        report.push_diagnostic(
+            "hooks.command_resolvable",
+            "boom",
+            Some("pre.loop.start".to_string()),
+            Some("env-guard".to_string()),
+            Some("./run.sh".to_string()),
+        );
+
+        assert!(!report.pass);
+        assert_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.code, "hooks.command_resolvable");
+        assert_eq!(diagnostic.message, "boom");
+        assert_eq!(diagnostic.phase_event.as_deref(), Some("pre.loop.start"));
+        assert_eq!(diagnostic.hook.as_deref(), Some("env-guard"));
+        assert_eq!(diagnostic.command.as_deref(), Some("./run.sh"));
+    }
+
+    #[test]
+    fn push_diagnostic_accumulates_multiple_failures() {
+        let mut report = HooksValidateReport::new("label".to_string());
+        report.push_diagnostic("a", "one", None, None, None);
+        report.push_diagnostic("b", "two", None, None, None);
+        assert!(!report.pass);
+        assert_eq!(report.diagnostics.len(), 2);
+    }
+
+    // ---------- validate_duplicate_names ----------
+
+    #[test]
+    fn validate_duplicate_names_passes_on_unique_names() {
+        let mut config = RalphConfig::default();
+        config.hooks.events.insert(
+            HookPhaseEvent::PreLoopStart,
+            vec![
+                build_hook("alpha", vec!["true".to_string()]),
+                build_hook("beta", vec!["true".to_string()]),
+            ],
+        );
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_duplicate_names(&config, &mut report);
+        assert!(report.pass);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validate_duplicate_names_flags_duplicates_in_same_phase() {
+        let mut config = RalphConfig::default();
+        config.hooks.events.insert(
+            HookPhaseEvent::PreLoopStart,
+            vec![
+                build_hook("alpha", vec!["true".to_string()]),
+                build_hook("alpha", vec!["true".to_string()]),
+            ],
+        );
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_duplicate_names(&config, &mut report);
+
+        assert!(!report.pass);
+        assert_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.code, "hooks.duplicate_name");
+        assert!(diagnostic.message.contains("Duplicate hook name 'alpha'"));
+        assert_eq!(diagnostic.phase_event.as_deref(), Some("pre.loop.start"));
+        assert_eq!(diagnostic.hook.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn validate_duplicate_names_allows_same_name_in_different_phases() {
+        let mut config = RalphConfig::default();
+        config.hooks.events.insert(
+            HookPhaseEvent::PreLoopStart,
+            vec![build_hook("shared", vec!["true".to_string()])],
+        );
+        config.hooks.events.insert(
+            HookPhaseEvent::PostLoopComplete,
+            vec![build_hook("shared", vec!["true".to_string()])],
+        );
+
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_duplicate_names(&config, &mut report);
+        assert!(report.pass);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validate_duplicate_names_ignores_empty_names() {
+        // Two empty name entries — validator should not dedupe because name is empty.
+        // (Real config validation rejects empty names; this guards the boundary.)
+        let mut config = RalphConfig::default();
+        config.hooks.events.insert(
+            HookPhaseEvent::PreLoopStart,
+            vec![
+                build_hook("", vec!["true".to_string()]),
+                build_hook("", vec!["true".to_string()]),
+            ],
+        );
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_duplicate_names(&config, &mut report);
+        assert!(report.pass);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    // ---------- validate_command_resolvability ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_command_resolvability_passes_for_existing_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cmd = bin.join("ralph-test-hook");
+        std::fs::write(&cmd, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&cmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = RalphConfig::default();
+        config.core.workspace_root = temp.path().to_path_buf();
+        let mut hook = build_hook("good-hook", vec!["ralph-test-hook".to_string()]);
+        hook.env
+            .insert("PATH".to_string(), bin.to_string_lossy().to_string());
+        config
+            .hooks
+            .events
+            .insert(HookPhaseEvent::PreLoopStart, vec![hook]);
+
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_command_resolvability(&config, &mut report);
+        assert!(report.pass, "diagnostics: {:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validate_command_resolvability_flags_missing_absolute_command() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("does-not-exist");
+
+        let mut config = RalphConfig::default();
+        config.core.workspace_root = temp.path().to_path_buf();
+        let hook = build_hook("bad-hook", vec![missing.to_string_lossy().to_string()]);
+        config
+            .hooks
+            .events
+            .insert(HookPhaseEvent::PreLoopStart, vec![hook]);
+
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_command_resolvability(&config, &mut report);
+
+        assert!(!report.pass);
+        assert_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.code, "hooks.command_resolvable");
+        assert_eq!(diagnostic.phase_event.as_deref(), Some("pre.loop.start"));
+        assert_eq!(diagnostic.hook.as_deref(), Some("bad-hook"));
+        assert!(diagnostic.message.contains("does not exist"));
+        // Hint line is appended for the user.
+        assert!(diagnostic.message.contains("Fix: ensure command exists"));
+    }
+
+    #[test]
+    fn validate_command_resolvability_skips_hook_with_empty_command() {
+        let mut config = RalphConfig::default();
+        // Zero-argv hook is skipped by the validator (higher-level validation
+        // catches this as a semantic error separately).
+        let hook = build_hook("empty-cmd", vec![]);
+        config
+            .hooks
+            .events
+            .insert(HookPhaseEvent::PreLoopStart, vec![hook]);
+
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_command_resolvability(&config, &mut report);
+        assert!(report.pass);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validate_command_resolvability_skips_whitespace_only_command() {
+        let mut config = RalphConfig::default();
+        let hook = build_hook("blank-cmd", vec!["   ".to_string()]);
+        config
+            .hooks
+            .events
+            .insert(HookPhaseEvent::PreLoopStart, vec![hook]);
+
+        let mut report = HooksValidateReport::new("label".to_string());
+        validate_command_resolvability(&config, &mut report);
+        assert!(report.pass);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    // ---------- build_report (async, integration-ish) ----------
+
+    #[tokio::test]
+    async fn build_report_passes_for_default_config_without_hooks() {
+        // No config file on disk — loader uses defaults; hooks default to disabled/empty.
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("does-not-exist.yml");
+        let sources = vec![ConfigSource::File(missing)];
+
+        let report = build_report(&sources, None).await;
+        assert!(report.pass, "diagnostics: {:?}", report.diagnostics);
+        assert!(!report.hooks_enabled);
+        assert_eq!(report.checked_hooks, 0);
+    }
+
+    #[tokio::test]
+    async fn build_report_flags_duplicate_hook_names_via_config_file() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("ralph.yml");
+        // Two hooks under the same phase-event with the same name. Both reference
+        // /bin/sh so resolvability passes on Unix CI; the focus is duplicate detection.
+        std::fs::write(
+            &config_path,
+            r#"
+cli:
+  backend: claude
+event_loop:
+  max_iterations: 1
+  completion_promise: LOOP_COMPLETE
+hats:
+  builder:
+    name: Builder
+    description: stub
+hooks:
+  enabled: true
+  events:
+    pre.loop.start:
+      - name: dup
+        command: ["/bin/sh", "-c", "true"]
+        on_error: warn
+      - name: dup
+        command: ["/bin/sh", "-c", "true"]
+        on_error: warn
+"#,
+        )
+        .unwrap();
+
+        let sources = vec![ConfigSource::File(config_path)];
+        let report = build_report(&sources, None).await;
+
+        assert!(!report.pass, "expected failure, got {:?}", report);
+        assert!(report.hooks_enabled);
+        assert_eq!(report.checked_hooks, 2);
+        let duplicate = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "hooks.duplicate_name");
+        assert!(
+            duplicate.is_some(),
+            "expected hooks.duplicate_name diagnostic, got {:?}",
+            report.diagnostics
+        );
+    }
+
+    // ---------- helpers ----------
+
+    /// Construct a HookSpec with sensible defaults for validator tests.
+    fn build_hook(name: &str, command: Vec<String>) -> HookSpec {
+        let yaml = format!(
+            "name: {name}\ncommand: {command:?}\non_error: warn\n",
+            name = name,
+            command = command,
+        );
+        let mut spec: HookSpec = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+            panic!("failed to parse HookSpec YAML for tests: {e}\nYAML:\n{yaml}")
+        });
+        // Belt-and-suspenders: ensure on_error is set for hook-semantic paths.
+        if spec.on_error.is_none() {
+            spec.on_error = Some(HookOnError::Warn);
+        }
+        spec
+    }
+}
