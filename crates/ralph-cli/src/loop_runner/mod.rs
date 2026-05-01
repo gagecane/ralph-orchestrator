@@ -6,10 +6,10 @@
 
 use anyhow::{Context, Result};
 use ralph_adapters::{
-    AcpExecutor, ClaudeStreamEvent, ClaudeStreamParser, CliBackend, CliExecutor,
-    ConsoleStreamHandler, ContentBlock, CopilotStreamParser, JsonRpcStreamHandler,
-    OutputFormat as BackendOutputFormat, PiAssistantEvent, PiStreamEvent,
-    PiStreamParser, PrettyStreamHandler, PtyConfig, PtyExecutor, QuietStreamHandler,
+    AcpExecutor, CliBackend, CliExecutor,
+    ConsoleStreamHandler, JsonRpcStreamHandler,
+    OutputFormat as BackendOutputFormat,
+    PrettyStreamHandler, PtyConfig, PtyExecutor, QuietStreamHandler,
     TuiStreamHandler,
 };
 use ralph_core::diagnostics::{HookDisposition, HookRunTelemetryEntry};
@@ -75,6 +75,11 @@ use helpers::{
 use helpers::{
     check_planning_session_responses_for_session, get_last_commit_info_with_cmd,
 };
+
+mod output;
+use output::normalize_cli_output_for_parsing;
+#[cfg(test)]
+use output::detect_solo_output_completion;
 
 /// Outcome of executing a prompt via PTY or CLI executor.
 pub(crate) struct ExecutionOutcome {
@@ -3875,75 +3880,6 @@ fn convert_termination_type(
         }
         ralph_adapters::TerminationType::UserInterrupt
         | ralph_adapters::TerminationType::ForceKill => Some(TerminationReason::Interrupted),
-    }
-}
-#[cfg(test)]
-fn detect_solo_output_completion(
-    registry: &ralph_core::HatRegistry,
-    output: &str,
-    completion_promise: &str,
-) -> bool {
-    registry.is_empty() && EventParser::contains_promise(output, completion_promise)
-}
-
-fn normalize_cli_output_for_parsing(
-    output_format: BackendOutputFormat,
-    raw_output: &str,
-) -> String {
-    match output_format {
-        BackendOutputFormat::StreamJson => extract_claude_stream_text(raw_output),
-        BackendOutputFormat::CopilotStreamJson => CopilotStreamParser::extract_all_text(raw_output),
-        BackendOutputFormat::PiStreamJson => extract_pi_stream_text(raw_output),
-        _ => raw_output.to_string(),
-    }
-}
-
-fn extract_claude_stream_text(raw_output: &str) -> String {
-    let mut extracted = String::new();
-
-    for line in raw_output.lines() {
-        let Some(event) = ClaudeStreamParser::parse_line(line) else {
-            continue;
-        };
-
-        if let ClaudeStreamEvent::Assistant { message, .. } = event {
-            for block in message.content {
-                if let ContentBlock::Text { text } = block {
-                    extracted.push_str(&text);
-                    extracted.push('\n');
-                }
-            }
-        }
-    }
-
-    if extracted.is_empty() {
-        raw_output.to_string()
-    } else {
-        extracted
-    }
-}
-
-fn extract_pi_stream_text(raw_output: &str) -> String {
-    let mut extracted = String::new();
-
-    for line in raw_output.lines() {
-        let Some(event) = PiStreamParser::parse_line(line) else {
-            continue;
-        };
-
-        if let PiStreamEvent::MessageUpdate {
-            assistant_message_event,
-        } = event
-            && let PiAssistantEvent::TextDelta { delta } = assistant_message_event
-        {
-            extracted.push_str(&delta);
-        }
-    }
-
-    if extracted.is_empty() {
-        raw_output.to_string()
-    } else {
-        extracted
     }
 }
 
