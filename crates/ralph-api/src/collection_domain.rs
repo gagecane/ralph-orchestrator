@@ -346,3 +346,516 @@ fn collection_not_found_error(collection_id: &str) -> ApiError {
     ApiError::collection_not_found(format!("Collection with id '{collection_id}' not found"))
         .with_details(serde_json::json!({ "collectionId": collection_id }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::errors::RpcErrorCode;
+
+    fn domain() -> (TempDir, CollectionDomain) {
+        let temp = TempDir::new().expect("tempdir");
+        let domain = CollectionDomain::new(temp.path());
+        (temp, domain)
+    }
+
+    fn sample_graph_value() -> Value {
+        json!({
+            "nodes": [
+                {
+                    "id": "planner",
+                    "type": "hatNode",
+                    "position": { "x": 10.0, "y": 20.0 },
+                    "data": {
+                        "key": "planner",
+                        "name": "Planner",
+                        "description": "Plans the work",
+                        "triggersOn": ["task.start"],
+                        "publishes": ["task.ready"],
+                        "instructions": "Plan carefully"
+                    }
+                }
+            ],
+            "edges": [],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        })
+    }
+
+    fn sample_yaml() -> String {
+        // Two hats linked via a shared event to exercise edge generation.
+        r"
+event_loop:
+  completion_promise: LOOP_COMPLETE
+  starting_event: task.start
+  max_iterations: 50
+cli:
+  backend: claude
+  prompt_mode: arg
+hats:
+  planner:
+    name: Planner
+    description: Plans things
+    triggers:
+      - task.start
+    publishes:
+      - task.ready
+    instructions: Plan carefully
+  builder:
+    name: Builder
+    description: Builds things
+    triggers:
+      - task.ready
+    publishes:
+      - LOOP_COMPLETE
+"
+        .to_string()
+    }
+
+    #[test]
+    fn new_on_empty_workspace_loads_nothing() {
+        let (_temp, domain) = domain();
+        assert!(domain.list().is_empty());
+        assert_eq!(domain.id_counter, 0);
+    }
+
+    #[test]
+    fn create_without_graph_uses_default_graph() {
+        let (_temp, mut domain) = domain();
+
+        let record = domain
+            .create(CollectionCreateParams {
+                name: "Empty".to_string(),
+                description: None,
+                graph: None,
+            })
+            .expect("create");
+
+        assert_eq!(record.name, "Empty");
+        assert!(record.description.is_none());
+        assert!(record.graph.nodes.is_empty());
+        assert!(record.graph.edges.is_empty());
+        assert!((record.graph.viewport.zoom - 1.0).abs() < f64::EPSILON);
+        assert_eq!(record.created_at, record.updated_at);
+        assert!(record.id.starts_with("collection-"));
+    }
+
+    #[test]
+    fn create_with_graph_parses_and_preserves_fields() {
+        let (_temp, mut domain) = domain();
+
+        let record = domain
+            .create(CollectionCreateParams {
+                name: "Loop".to_string(),
+                description: Some("desc".to_string()),
+                graph: Some(sample_graph_value()),
+            })
+            .expect("create");
+
+        assert_eq!(record.description.as_deref(), Some("desc"));
+        assert_eq!(record.graph.nodes.len(), 1);
+        let node = &record.graph.nodes[0];
+        assert_eq!(node.id, "planner");
+        assert_eq!(node.node_type, "hatNode");
+        assert_eq!(node.data.key, "planner");
+        assert_eq!(node.data.name, "Planner");
+        assert_eq!(node.data.triggers_on, vec!["task.start".to_string()]);
+        assert_eq!(node.data.publishes, vec!["task.ready".to_string()]);
+        assert_eq!(
+            node.data.instructions.as_deref(),
+            Some("Plan carefully")
+        );
+    }
+
+    #[test]
+    fn create_rejects_invalid_graph_shape() {
+        let (_temp, mut domain) = domain();
+
+        let err = domain
+            .create(CollectionCreateParams {
+                name: "Bad".to_string(),
+                description: None,
+                graph: Some(json!({ "nodes": "not a list" })),
+            })
+            .expect_err("should reject invalid graph");
+
+        assert_eq!(err.code, RpcErrorCode::InvalidParams);
+        assert!(err.message.contains("invalid collection graph"));
+    }
+
+    #[test]
+    fn get_missing_returns_not_found_with_details() {
+        let (_temp, domain) = domain();
+
+        let err = domain
+            .get("collection-missing")
+            .expect_err("should be not found");
+
+        assert_eq!(err.code, RpcErrorCode::CollectionNotFound);
+        let details = err.details.expect("details");
+        assert_eq!(details["collectionId"], json!("collection-missing"));
+    }
+
+    #[test]
+    fn list_returns_summaries_sorted_by_name_then_id() {
+        let (_temp, mut domain) = domain();
+
+        let b = domain
+            .create(CollectionCreateParams {
+                name: "Beta".to_string(),
+                description: None,
+                graph: None,
+            })
+            .expect("create beta");
+        let a = domain
+            .create(CollectionCreateParams {
+                name: "Alpha".to_string(),
+                description: Some("first".to_string()),
+                graph: None,
+            })
+            .expect("create alpha");
+
+        let summaries = domain.list();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, a.id);
+        assert_eq!(summaries[0].name, "Alpha");
+        assert_eq!(summaries[0].description.as_deref(), Some("first"));
+        assert_eq!(summaries[1].id, b.id);
+        assert_eq!(summaries[1].name, "Beta");
+    }
+
+    #[test]
+    fn update_partial_fields_leaves_others_untouched() {
+        let (_temp, mut domain) = domain();
+        let record = domain
+            .create(CollectionCreateParams {
+                name: "Original".to_string(),
+                description: Some("keep".to_string()),
+                graph: None,
+            })
+            .expect("create");
+
+        // Rename only.
+        let renamed = domain
+            .update(CollectionUpdateParams {
+                id: record.id.clone(),
+                name: Some("Renamed".to_string()),
+                description: None,
+                graph: None,
+            })
+            .expect("update name");
+
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.description.as_deref(), Some("keep"));
+        assert_eq!(renamed.id, record.id);
+        // updated_at is RFC3339 seconds — may equal created_at if within the
+        // same second; assert it was at least set to something non-empty.
+        assert!(!renamed.updated_at.is_empty());
+
+        // Swap graph.
+        let regraphed = domain
+            .update(CollectionUpdateParams {
+                id: record.id.clone(),
+                name: None,
+                description: None,
+                graph: Some(sample_graph_value()),
+            })
+            .expect("update graph");
+        assert_eq!(regraphed.graph.nodes.len(), 1);
+        assert_eq!(regraphed.graph.nodes[0].data.key, "planner");
+    }
+
+    #[test]
+    fn update_rejects_invalid_graph_without_mutating_record() {
+        let (_temp, mut domain) = domain();
+        let record = domain
+            .create(CollectionCreateParams {
+                name: "Immutable".to_string(),
+                description: None,
+                graph: Some(sample_graph_value()),
+            })
+            .expect("create");
+
+        let err = domain
+            .update(CollectionUpdateParams {
+                id: record.id.clone(),
+                name: None,
+                description: None,
+                graph: Some(json!({ "nodes": 42 })),
+            })
+            .expect_err("should reject");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams);
+
+        // Graph should still be the originally parsed one.
+        let current = domain.get(&record.id).expect("still exists");
+        assert_eq!(current.graph.nodes.len(), 1);
+        assert_eq!(current.graph.nodes[0].id, "planner");
+    }
+
+    #[test]
+    fn update_missing_returns_not_found() {
+        let (_temp, mut domain) = domain();
+        let err = domain
+            .update(CollectionUpdateParams {
+                id: "ghost".to_string(),
+                name: Some("x".to_string()),
+                description: None,
+                graph: None,
+            })
+            .expect_err("should fail");
+        assert_eq!(err.code, RpcErrorCode::CollectionNotFound);
+    }
+
+    #[test]
+    fn delete_removes_record_and_missing_is_error() {
+        let (_temp, mut domain) = domain();
+        let record = domain
+            .create(CollectionCreateParams {
+                name: "Ephemeral".to_string(),
+                description: None,
+                graph: None,
+            })
+            .expect("create");
+
+        domain.delete(&record.id).expect("delete");
+        assert!(domain.list().is_empty());
+        assert!(domain.get(&record.id).is_err());
+
+        let err = domain.delete(&record.id).expect_err("already gone");
+        assert_eq!(err.code, RpcErrorCode::CollectionNotFound);
+    }
+
+    #[test]
+    fn persist_and_reload_preserves_collections_and_id_counter() {
+        let temp = TempDir::new().expect("tempdir");
+        let first_id;
+        let second_id;
+        {
+            let mut domain = CollectionDomain::new(temp.path());
+            first_id = domain
+                .create(CollectionCreateParams {
+                    name: "First".to_string(),
+                    description: None,
+                    graph: Some(sample_graph_value()),
+                })
+                .expect("first")
+                .id;
+            second_id = domain
+                .create(CollectionCreateParams {
+                    name: "Second".to_string(),
+                    description: Some("2".to_string()),
+                    graph: None,
+                })
+                .expect("second")
+                .id;
+        }
+
+        let snapshot_path = temp.path().join(".ralph/api/collections-v1.json");
+        assert!(snapshot_path.exists(), "snapshot file should be written");
+
+        let reloaded = CollectionDomain::new(temp.path());
+        let summaries = reloaded.list();
+        assert_eq!(summaries.len(), 2);
+        let ids: Vec<_> = summaries.iter().map(|s| s.id.clone()).collect();
+        assert!(ids.contains(&first_id));
+        assert!(ids.contains(&second_id));
+        assert_eq!(reloaded.id_counter, 2);
+
+        let first = reloaded.get(&first_id).expect("first reload");
+        assert_eq!(first.graph.nodes.len(), 1);
+        assert_eq!(first.graph.nodes[0].data.key, "planner");
+    }
+
+    #[test]
+    fn load_ignores_corrupt_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let snapshot_path = temp.path().join(".ralph/api/collections-v1.json");
+        fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        fs::write(&snapshot_path, "{ not valid json").unwrap();
+
+        let domain = CollectionDomain::new(temp.path());
+        // Corrupt file is logged and ignored — domain should start empty.
+        assert!(domain.list().is_empty());
+        assert_eq!(domain.id_counter, 0);
+    }
+
+    #[test]
+    fn import_builds_nodes_and_cross_hat_edges() {
+        let (_temp, mut domain) = domain();
+
+        let record = domain
+            .import(CollectionImportParams {
+                yaml: sample_yaml(),
+                name: "Imported".to_string(),
+                description: Some("from yaml".to_string()),
+            })
+            .expect("import");
+
+        // Two hats.
+        assert_eq!(record.graph.nodes.len(), 2);
+        let keys: Vec<_> = record
+            .graph
+            .nodes
+            .iter()
+            .map(|node| node.data.key.clone())
+            .collect();
+        assert!(keys.contains(&"planner".to_string()));
+        assert!(keys.contains(&"builder".to_string()));
+
+        // Exactly one edge — planner publishes task.ready which builder triggers on.
+        // (task.start is only a trigger with no publisher; LOOP_COMPLETE is only
+        // published with no subscriber.)
+        assert_eq!(record.graph.edges.len(), 1);
+        let edge = &record.graph.edges[0];
+        assert_eq!(edge.source, "planner");
+        assert_eq!(edge.target, "builder");
+        assert_eq!(edge.label.as_deref(), Some("task.ready"));
+        assert_eq!(edge.source_handle.as_deref(), Some("task.ready"));
+        assert_eq!(edge.target_handle.as_deref(), Some("task.ready"));
+
+        // Viewport override from yaml importer.
+        assert!((record.graph.viewport.zoom - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn import_rejects_non_mapping_yaml() {
+        let (_temp, mut domain) = domain();
+        let err = domain
+            .import(CollectionImportParams {
+                yaml: "- just\n- a\n- list\n".to_string(),
+                name: "bad".to_string(),
+                description: None,
+            })
+            .expect_err("should reject");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams);
+        assert!(err.message.contains("must be a mapping"));
+    }
+
+    #[test]
+    fn import_rejects_yaml_without_hats() {
+        let (_temp, mut domain) = domain();
+        let err = domain
+            .import(CollectionImportParams {
+                yaml: "event_loop:\n  completion_promise: x\n".to_string(),
+                name: "bad".to_string(),
+                description: None,
+            })
+            .expect_err("should reject");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams);
+        assert!(err.message.contains("must define hats"));
+    }
+
+    #[test]
+    fn import_rejects_malformed_yaml() {
+        let (_temp, mut domain) = domain();
+        let err = domain
+            .import(CollectionImportParams {
+                yaml: ":\n\t: not yaml".to_string(),
+                name: "bad".to_string(),
+                description: None,
+            })
+            .expect_err("should reject");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams);
+        assert!(err.message.contains("invalid YAML"));
+    }
+
+    #[test]
+    fn export_emits_yaml_containing_hat_keys_and_events() {
+        let (_temp, mut domain) = domain();
+        let record = domain
+            .import(CollectionImportParams {
+                yaml: sample_yaml(),
+                name: "Exported".to_string(),
+                description: Some("round trip".to_string()),
+            })
+            .expect("import");
+
+        let yaml = domain.export(&record.id).expect("export");
+        assert!(yaml.contains("# Exported"));
+        assert!(yaml.contains("# round trip"));
+        assert!(yaml.contains("hats:"));
+        assert!(yaml.contains("planner:"));
+        assert!(yaml.contains("builder:"));
+        assert!(yaml.contains("task.ready"));
+        assert!(yaml.contains("event_loop:"));
+    }
+
+    #[test]
+    fn export_missing_is_not_found() {
+        let (_temp, domain) = domain();
+        let err = domain.export("nope").expect_err("should fail");
+        assert_eq!(err.code, RpcErrorCode::CollectionNotFound);
+    }
+
+    #[test]
+    fn import_export_import_preserves_hat_keys_and_edges() {
+        let (_temp, mut domain) = domain();
+        let first = domain
+            .import(CollectionImportParams {
+                yaml: sample_yaml(),
+                name: "Original".to_string(),
+                description: None,
+            })
+            .expect("import 1");
+
+        let exported = domain.export(&first.id).expect("export");
+        let reimported = domain
+            .import(CollectionImportParams {
+                yaml: exported,
+                name: "Reimported".to_string(),
+                description: None,
+            })
+            .expect("import 2");
+
+        let mut first_keys: Vec<_> = first
+            .graph
+            .nodes
+            .iter()
+            .map(|node| node.data.key.clone())
+            .collect();
+        first_keys.sort();
+        let mut second_keys: Vec<_> = reimported
+            .graph
+            .nodes
+            .iter()
+            .map(|node| node.data.key.clone())
+            .collect();
+        second_keys.sort();
+        assert_eq!(first_keys, second_keys);
+
+        // The planner→builder edge is preserved across the round trip.
+        let has_edge = reimported
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.source == "planner" && edge.target == "builder");
+        assert!(has_edge, "planner→builder edge should survive round trip");
+    }
+
+    #[test]
+    fn id_counter_assigns_distinct_ids_monotonically() {
+        let (_temp, mut domain) = domain();
+        let a = domain
+            .create(CollectionCreateParams {
+                name: "A".to_string(),
+                description: None,
+                graph: None,
+            })
+            .expect("create a");
+        let b = domain
+            .create(CollectionCreateParams {
+                name: "B".to_string(),
+                description: None,
+                graph: None,
+            })
+            .expect("create b");
+
+        assert_ne!(a.id, b.id);
+        // Suffix is a hex counter — ensure both ids carry one and they differ.
+        let suffix = |id: &str| id.rsplit('-').next().map(str::to_string).unwrap();
+        assert_eq!(suffix(&a.id), "0001");
+        assert_eq!(suffix(&b.id), "0002");
+    }
+}
