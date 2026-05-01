@@ -317,3 +317,318 @@ fn load_config(root: &Path) -> RalphConfig {
 
     config
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ralph_core::{SkillEntry, SkillSource};
+    use tempfile::TempDir;
+
+    fn make_skill(name: &str, source: SkillSource) -> SkillEntry {
+        SkillEntry {
+            name: name.to_string(),
+            description: "A test skill".to_string(),
+            content: "body".to_string(),
+            source,
+            hats: vec!["reviewer".to_string()],
+            backends: vec!["claude".to_string()],
+            tags: vec!["t1".to_string(), "t2".to_string()],
+            auto_inject: true,
+        }
+    }
+
+    // ---------- format_source ----------
+
+    #[test]
+    fn test_format_source_builtin() {
+        let skill = make_skill("s", SkillSource::BuiltIn);
+        assert_eq!(format_source(&skill), "built-in");
+    }
+
+    #[test]
+    fn test_format_source_file() {
+        let path = PathBuf::from("/tmp/skills/test.md");
+        let skill = make_skill("s", SkillSource::File(path.clone()));
+        assert_eq!(format_source(&skill), path.display().to_string());
+    }
+
+    // ---------- SkillListItem::from ----------
+
+    #[test]
+    fn test_skill_list_item_from_builtin() {
+        let skill = make_skill("my-skill", SkillSource::BuiltIn);
+        let item = SkillListItem::from(&skill);
+
+        assert_eq!(item.name, "my-skill");
+        assert_eq!(item.description, "A test skill");
+        assert_eq!(item.source, "built-in");
+        assert_eq!(item.path, None);
+        assert_eq!(item.hats, vec!["reviewer".to_string()]);
+        assert_eq!(item.backends, vec!["claude".to_string()]);
+        assert_eq!(item.tags, vec!["t1".to_string(), "t2".to_string()]);
+        assert!(item.auto_inject);
+    }
+
+    #[test]
+    fn test_skill_list_item_from_file() {
+        let path = PathBuf::from("/tmp/skills/my.md");
+        let skill = make_skill("my-skill", SkillSource::File(path.clone()));
+        let item = SkillListItem::from(&skill);
+
+        assert_eq!(item.source, "file");
+        assert_eq!(item.path.as_deref(), Some(path.display().to_string().as_str()));
+    }
+
+    #[test]
+    fn test_skill_list_item_serializes_to_json() {
+        let skill = make_skill("my-skill", SkillSource::BuiltIn);
+        let item = SkillListItem::from(&skill);
+        let json = serde_json::to_string(&item).expect("serialize");
+
+        assert!(json.contains("\"name\":\"my-skill\""));
+        assert!(json.contains("\"source\":\"built-in\""));
+        assert!(json.contains("\"auto_inject\":true"));
+        // path is None → should serialize as null
+        assert!(json.contains("\"path\":null"));
+    }
+
+    // ---------- resolve_root ----------
+
+    #[test]
+    fn test_resolve_root_with_explicit_path() {
+        let explicit = PathBuf::from("/some/path");
+        let resolved = resolve_root(Some(explicit.clone())).expect("resolve");
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn test_resolve_root_without_explicit_returns_path() {
+        // Without explicit root, resolve_root returns either the discovered
+        // workspace root or the current directory — both are valid absolute paths.
+        let resolved = resolve_root(None).expect("resolve");
+        assert!(resolved.is_absolute() || resolved.exists());
+    }
+
+    // ---------- find_workspace_root ----------
+
+    #[test]
+    fn test_find_workspace_root_finds_ralph_yml_in_start_dir() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("ralph.yml"), "cli:\n  backend: claude\n").expect("write");
+
+        let found = find_workspace_root(root).expect("found");
+        assert_eq!(found, root);
+    }
+
+    #[test]
+    fn test_find_workspace_root_finds_ralph_yaml_in_start_dir() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("ralph.yaml"), "cli:\n  backend: claude\n").expect("write");
+
+        let found = find_workspace_root(root).expect("found");
+        assert_eq!(found, root);
+    }
+
+    #[test]
+    fn test_find_workspace_root_walks_up_to_find_config() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("ralph.yml"), "cli:\n  backend: claude\n").expect("write");
+
+        let nested = root.join("a/b/c");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+
+        let found = find_workspace_root(&nested).expect("found");
+        assert_eq!(found, root);
+    }
+
+    #[test]
+    fn test_find_workspace_root_returns_none_when_no_config() {
+        let tmp = TempDir::new().expect("tmp");
+        let nested = tmp.path().join("deep/nested/dir");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+
+        // Note: this may find a config on a parent if /tmp happens to be under
+        // a ralph workspace, but in a clean TempDir it should walk to / without
+        // finding one. We assert that if it does return something, it's above
+        // the tmp dir (i.e., not a false positive inside our tree).
+        if let Some(found) = find_workspace_root(&nested) {
+            assert!(!found.starts_with(tmp.path()));
+        }
+    }
+
+    // ---------- resolve_configured_skills_dir ----------
+
+    #[test]
+    fn test_resolve_configured_skills_dir_absolute_path_returned_as_is() {
+        let tmp = TempDir::new().expect("tmp");
+        let abs_path = tmp.path().join("abs-skills");
+        std::fs::create_dir(&abs_path).expect("mkdir");
+
+        let resolved = resolve_configured_skills_dir(tmp.path(), &abs_path);
+        assert_eq!(resolved, abs_path);
+    }
+
+    #[test]
+    fn test_resolve_configured_skills_dir_relative_under_root() {
+        let tmp = TempDir::new().expect("tmp");
+        let rel = Path::new("skills");
+        let absolute = tmp.path().join("skills");
+        std::fs::create_dir(&absolute).expect("mkdir");
+
+        let resolved = resolve_configured_skills_dir(tmp.path(), rel);
+        assert_eq!(resolved, absolute);
+    }
+
+    #[test]
+    fn test_resolve_configured_skills_dir_walks_up_to_parent() {
+        let tmp = TempDir::new().expect("tmp");
+        // Create directory in parent but not at root
+        let parent = tmp.path();
+        let child = parent.join("child");
+        std::fs::create_dir(&child).expect("mkdir child");
+        let skills = parent.join("shared-skills");
+        std::fs::create_dir(&skills).expect("mkdir skills");
+
+        let resolved = resolve_configured_skills_dir(&child, Path::new("shared-skills"));
+        assert_eq!(resolved, skills);
+    }
+
+    #[test]
+    fn test_resolve_configured_skills_dir_missing_returns_candidate() {
+        let tmp = TempDir::new().expect("tmp");
+        // No skills dir exists anywhere
+        let rel = Path::new("does-not-exist-skills");
+        let resolved = resolve_configured_skills_dir(tmp.path(), rel);
+
+        // Fallback candidate is root.join(dir)
+        assert_eq!(resolved, tmp.path().join("does-not-exist-skills"));
+    }
+
+    // ---------- find_default_skills_dir ----------
+
+    #[test]
+    fn test_find_default_skills_dir_finds_in_root() {
+        let tmp = TempDir::new().expect("tmp");
+        let skills = tmp.path().join(".claude/skills");
+        std::fs::create_dir_all(&skills).expect("mkdir skills");
+
+        let found = find_default_skills_dir(tmp.path()).expect("found");
+        // Compare canonicalized paths to handle symlinks (e.g., /tmp → /private/tmp)
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(&skills).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_find_default_skills_dir_none_when_missing() {
+        let tmp = TempDir::new().expect("tmp");
+        // No .claude/skills exists and parents shouldn't have one either (TempDir)
+        let result = find_default_skills_dir(tmp.path());
+
+        // If system happens to have .claude/skills above /tmp, we can't assert
+        // None. But we CAN assert: if something is returned, it is NOT under
+        // our tmp dir (since we didn't create one there).
+        if let Some(found) = result {
+            assert!(!found.starts_with(tmp.path()));
+        }
+    }
+
+    // ---------- load_config ----------
+
+    #[test]
+    fn test_load_config_returns_default_when_no_config_file() {
+        let tmp = TempDir::new().expect("tmp");
+        // No ralph.yml, no .claude/skills
+        let config = load_config(tmp.path());
+
+        // Should at least produce a usable default config
+        assert!(!config.cli.backend.is_empty());
+    }
+
+    #[test]
+    fn test_load_config_reads_workspace_ralph_yml() {
+        let tmp = TempDir::new().expect("tmp");
+        std::fs::write(
+            tmp.path().join("ralph.yml"),
+            "cli:\n  backend: kiro\n",
+        )
+        .expect("write");
+
+        let config = load_config(tmp.path());
+        assert_eq!(config.cli.backend, "kiro");
+    }
+
+    #[test]
+    fn test_load_config_adds_default_skills_dir_when_present() {
+        let tmp = TempDir::new().expect("tmp");
+        std::fs::write(tmp.path().join("ralph.yml"), "cli:\n  backend: claude\n").expect("write");
+        let default_skills = tmp.path().join(".claude/skills");
+        std::fs::create_dir_all(&default_skills).expect("mkdir");
+
+        let config = load_config(tmp.path());
+
+        // With no configured dirs, default `.claude/skills` should be added.
+        // Compare canonicalized paths because TempDir on macOS resolves /tmp -> /private/tmp.
+        let expected = std::fs::canonicalize(&default_skills).expect("canonicalize expected");
+        assert!(
+            config.skills.dirs.iter().any(|dir| {
+                std::fs::canonicalize(dir)
+                    .map(|canon| canon == expected)
+                    .unwrap_or(false)
+            }),
+            "expected default skills dir in config.skills.dirs, got: {:?}",
+            config.skills.dirs
+        );
+    }
+
+    // ---------- build_registry ----------
+
+    #[test]
+    fn test_build_registry_includes_builtins() {
+        let tmp = TempDir::new().expect("tmp");
+        std::fs::write(tmp.path().join("ralph.yml"), "cli:\n  backend: claude\n").expect("write");
+
+        let registry = build_registry(tmp.path()).expect("build");
+        // Built-in skills should always be registered.
+        assert!(registry.get("ralph-tools").is_some());
+        assert!(registry.get("ralph-tools-tasks").is_some());
+    }
+
+    #[test]
+    fn test_build_registry_discovers_user_skill() {
+        let tmp = TempDir::new().expect("tmp");
+        std::fs::write(tmp.path().join("ralph.yml"), "cli:\n  backend: claude\n").expect("write");
+
+        let skill_dir = tmp.path().join(".claude/skills");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("custom.md"),
+            "---\nname: custom\ndescription: Custom skill\n---\n\ncustom body\n",
+        )
+        .expect("write");
+
+        let registry = build_registry(tmp.path()).expect("build");
+        let custom = registry.get("custom").expect("custom skill found");
+        assert_eq!(custom.description, "Custom skill");
+    }
+
+    // ---------- OutputFormat ----------
+
+    #[test]
+    fn test_output_format_default_is_table() {
+        assert_eq!(OutputFormat::default(), OutputFormat::Table);
+    }
+
+    #[test]
+    fn test_output_format_values_distinct() {
+        // Sanity: each variant is distinct (guards against future refactors
+        // accidentally making variants equal).
+        assert_ne!(OutputFormat::Table, OutputFormat::Json);
+        assert_ne!(OutputFormat::Json, OutputFormat::Quiet);
+        assert_ne!(OutputFormat::Table, OutputFormat::Quiet);
+    }
+}
