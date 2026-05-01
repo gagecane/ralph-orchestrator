@@ -9,8 +9,20 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import { execSync } from "child_process";
 import type { TaskRepository } from "../repositories";
-import { getGitRepoRoot } from "./TaskBridge.helpers";
+
+/**
+ * Get the git repository root path from a given directory.
+ * Falls back to the provided directory if not in a git repo.
+ */
+function getGitRepoRoot(cwd: string): string {
+  try {
+    return execSync("git rev-parse --show-toplevel", { cwd, encoding: "utf-8" }).trim();
+  } catch {
+    return cwd;
+  }
+}
 
 /**
  * Resolve the loop ID for a task by matching its title against loop prompts.

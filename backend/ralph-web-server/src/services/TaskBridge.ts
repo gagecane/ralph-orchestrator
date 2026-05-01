@@ -19,48 +19,162 @@
  *                                                       ↓
  *               TaskBridge subscribes → updates DB → UI refreshes
  * ```
- *
- * Supporting modules:
- * - `TaskBridge.types.ts`         — event payload and public result types
- * - `TaskBridge.helpers.ts`       — `getGitRepoRoot`, `extractSummaryFromOutput`
- * - `TaskBridge.configResolver.ts` — preset/config → `-c <path>` CLI args
- * - `TaskBridge.loopResolver.ts`  — loop ID lookup + post-start polling helper
  */
 
 import * as fs from "fs";
 import * as path from "path";
+import { execSync } from "child_process";
 import stripAnsi from "strip-ansi";
 import { TaskRepository } from "../repositories";
 import { ProcessSupervisor } from "../runner/ProcessSupervisor";
 import { FileOutputStreamer } from "../runner/FileOutputStreamer";
 import { CollectionService } from "./CollectionService";
 import { ConfigMerger } from "./ConfigMerger";
-import { TaskQueueService } from "../queue/TaskQueueService";
+
+/**
+ * Get the git repository root path from a given directory.
+ * Falls back to the provided directory if not in a git repo.
+ */
+function getGitRepoRoot(cwd: string): string {
+  try {
+    return execSync("git rev-parse --show-toplevel", { cwd, encoding: "utf-8" }).trim();
+  } catch {
+    return cwd;
+  }
+}
+import { TaskQueueService, QueuedTask } from "../queue/TaskQueueService";
 import { EventBus, Event, Subscription } from "../queue/EventBus";
 import { Task } from "../db/schema";
-
-import { getGitRepoRoot, extractSummaryFromOutput } from "./TaskBridge.helpers";
-import { resolveConfigArgs } from "./TaskBridge.configResolver";
 import {
   resolveLoopId,
   scheduleLoopIdResolution,
 } from "./TaskBridge.loopResolver";
-import type {
-  EnqueueAllResult,
-  EnqueueResult,
-  ExecutionStatus,
-  TaskCompletedPayload,
-  TaskFailedPayload,
-  TaskStartedPayload,
-  TaskTimeoutPayload,
-} from "./TaskBridge.types";
 
-// Re-export public types so existing `from "./TaskBridge"` imports keep working.
-export type {
-  EnqueueAllResult,
-  EnqueueResult,
-  ExecutionStatus,
-} from "./TaskBridge.types";
+/**
+ * Payload for task.started events
+ */
+interface TaskStartedPayload {
+  taskId: string;
+  taskType: string;
+  payload: Record<string, unknown>;
+  priority: number;
+}
+
+/**
+ * Result from RalphRunner (partial interface for what we need)
+ */
+interface RunnerResultPayload {
+  stdout?: string;
+  stderr?: string;
+  combined?: string;
+  exitCode?: number;
+}
+
+/**
+ * Payload for task.completed events
+ */
+interface TaskCompletedPayload {
+  taskId: string;
+  taskType: string;
+  result: RunnerResultPayload;
+  durationMs: number;
+}
+
+/**
+ * Extract a meaningful summary from task output.
+ * Looks for the last substantive message that describes what was accomplished.
+ */
+function extractSummaryFromOutput(result: RunnerResultPayload): string | null {
+  const output = result.combined || result.stdout || "";
+  if (!output) return null;
+
+  const lines = output.split("\n").filter((line) => line.trim());
+
+  // Look for summary-like content in the last 30 lines
+  const lastLines = lines.slice(-30);
+
+  // Try to find meaningful summary lines (not just status/progress)
+  const summaryPatterns = [
+    /^#+\s*(summary|completed|done|result)/i,
+    /completed.*successfully/i,
+    /task.*complete/i,
+    /all.*pass/i,
+    /commit.*:/i,
+  ];
+
+  // Collect meaningful lines
+  const meaningfulLines: string[] = [];
+  let inSummarySection = false;
+
+  for (const line of lastLines) {
+    // Check if we're entering a summary section
+    if (summaryPatterns.some((p) => p.test(line))) {
+      inSummarySection = true;
+    }
+
+    // Skip noise lines
+    if (line.startsWith(">") || line.includes("───") || line.match(/^\s*$/)) {
+      continue;
+    }
+
+    if (inSummarySection || meaningfulLines.length > 0) {
+      meaningfulLines.push(line);
+    }
+  }
+
+  // If we found summary content, return it
+  if (meaningfulLines.length > 0) {
+    return meaningfulLines.slice(0, 15).join("\n"); // Cap at 15 lines
+  }
+
+  // Fallback: return last few non-empty lines
+  return lastLines.slice(-5).join("\n") || null;
+}
+
+/**
+ * Payload for task.failed events
+ */
+interface TaskFailedPayload {
+  taskId: string;
+  taskType: string;
+  error: string;
+  durationMs: number;
+}
+
+/**
+ * Payload for task.timeout events
+ */
+interface TaskTimeoutPayload {
+  taskId: string;
+  taskType: string;
+  timeoutMs: number;
+  durationMs: number;
+}
+
+/**
+ * Result of enqueuing a task
+ */
+export interface EnqueueResult {
+  success: boolean;
+  queuedTaskId?: string;
+  error?: string;
+}
+
+/**
+ * Result of enqueuing all pending tasks
+ */
+export interface EnqueueAllResult {
+  enqueued: number;
+  errors: Array<{ taskId: string; error: string }>;
+}
+
+/**
+ * Execution status for a database task
+ */
+export interface ExecutionStatus {
+  isQueued: boolean;
+  queuedTask?: QueuedTask;
+}
 
 /**
  * TaskBridge configuration options
@@ -130,21 +244,28 @@ export class TaskBridge {
    * Subscribe to EventBus events for task lifecycle updates
    */
   private subscribeToEvents(): void {
+    // task.started → update DB status to 'running'
     this.subscriptions.push(
       this.eventBus.subscribe<TaskStartedPayload>("task.started", (event) => {
         this.handleTaskStarted(event);
       })
     );
+
+    // task.completed → update DB status to 'closed'
     this.subscriptions.push(
       this.eventBus.subscribe<TaskCompletedPayload>("task.completed", (event) => {
         this.handleTaskCompleted(event);
       })
     );
+
+    // task.failed → update DB status to 'failed' with errorMessage
     this.subscriptions.push(
       this.eventBus.subscribe<TaskFailedPayload>("task.failed", (event) => {
         this.handleTaskFailed(event);
       })
     );
+
+    // task.timeout → update DB status to 'failed' with timeout message
     this.subscriptions.push(
       this.eventBus.subscribe<TaskTimeoutPayload>("task.timeout", (event) => {
         this.handleTaskTimeout(event);
@@ -261,6 +382,7 @@ export class TaskBridge {
       durationMs,
     });
 
+    // Clean up the mapping
     this.taskIdMap.delete(queuedTaskId);
   }
 
@@ -283,6 +405,7 @@ export class TaskBridge {
       durationMs,
     });
 
+    // Clean up the mapping
     this.taskIdMap.delete(queuedTaskId);
   }
 
@@ -305,13 +428,54 @@ export class TaskBridge {
         return { success: false, error: "Task is already queued" };
       }
 
-      const args = resolveConfigArgs({
-        preset,
-        defaultCwd: this.defaultCwd,
-        defaultConfigPath: this.defaultConfigPath,
-        configMerger: this.configMerger,
-        collectionService: this.collectionService,
-      });
+      // Build additional args for config/preset
+      // When a ConfigMerger is available, merge the base config with the preset's hats,
+      // preserving base settings (max_iterations, backend, guardrails, etc.).
+      // Without ConfigMerger, fall back to the legacy behavior of replacing the entire config.
+      const args: string[] = [];
+
+      if (this.configMerger && this.defaultConfigPath) {
+        // Merge base config with preset hats (or use base config as-is for "default")
+        const mergeResult = this.configMerger.merge(
+          this.defaultConfigPath,
+          preset ?? "default"
+        );
+        args.push("-c", mergeResult.tempPath);
+      } else {
+        // Legacy fallback: resolve preset to config path without merging
+        let configResolved = false;
+
+        if (preset) {
+          const builtinMatch = preset.match(/^builtin:(.+)$/);
+          const directoryMatch = preset.match(/^directory:(.+)$/);
+
+          if (builtinMatch) {
+            args.push("-c", preset);
+            configResolved = true;
+          } else if (directoryMatch) {
+            const presetName = directoryMatch[1];
+            const presetPath = path.join(this.defaultCwd, ".ralph", "hats", `${presetName}.yml`);
+            args.push("-c", presetPath);
+            configResolved = true;
+          } else if (this.collectionService) {
+            const yamlContent = this.collectionService.exportToYaml(preset);
+            if (yamlContent) {
+              const tempDir = path.join(this.defaultCwd, ".ralph", "temp");
+              if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+              }
+              const tempPath = path.join(tempDir, `collection-${preset}.yml`);
+              fs.writeFileSync(tempPath, yamlContent, "utf-8");
+              args.push("-c", tempPath);
+              configResolved = true;
+            }
+          }
+        }
+
+        if (!configResolved && this.defaultConfigPath) {
+          args.push("-c", this.defaultConfigPath);
+        }
+      }
 
       // Enqueue the task with the title as the prompt
       const queuedTask = this.taskQueue.enqueue({
@@ -377,6 +541,9 @@ export class TaskBridge {
 
   /**
    * Get execution status for a database task.
+   *
+   * @param dbTaskId - Database task ID
+   * @returns Execution status with queue info
    */
   getExecutionStatus(dbTaskId: string): ExecutionStatus {
     const dbTask = this.taskRepository.findById(dbTaskId);
@@ -395,6 +562,9 @@ export class TaskBridge {
 
   /**
    * Reset a failed task and re-enqueue it for execution.
+   *
+   * @param dbTaskId - Database task ID
+   * @returns Result with success status and new queued task ID
    */
   retryTask(dbTaskId: string): EnqueueResult {
     const dbTask = this.taskRepository.findById(dbTaskId);
@@ -429,6 +599,8 @@ export class TaskBridge {
    * Recover tasks that are stuck in 'running' state.
    * This handles cases where the server restarted while a task was executing.
    * Stuck tasks are marked as failed.
+   *
+   * @returns Count of recovered tasks
    */
   recoverStuckTasks(): number {
     const runningTasks = this.taskRepository.findAll("running");
@@ -451,6 +623,8 @@ export class TaskBridge {
    * Reconnect to running ralph processes after server restart.
    * Attempts to reconnect to each running task's process.
    * If alive, resumes output streaming. If dead, marks as failed.
+   *
+   * @returns Object with counts of reconnected and failed tasks
    */
   reconnectRunningTasks(): { reconnected: number; failed: number } {
     if (!this.processSupervisor || !this.outputStreamer) {
@@ -471,6 +645,7 @@ export class TaskBridge {
 
           // Resume output streaming
           this.outputStreamer.stream(task.id, handle.taskDir, (line, source) => {
+            // Broadcast via EventBus for WebSocket clients
             this.eventBus.publish("task.output", {
               taskId: task.id,
               line,
@@ -512,6 +687,9 @@ export class TaskBridge {
 
   /**
    * Cancel a running task by stopping the underlying process.
+   *
+   * @param dbTaskId - Database task ID to cancel
+   * @returns Result with success status
    */
   cancelTask(dbTaskId: string): EnqueueResult {
     const dbTask = this.taskRepository.findById(dbTaskId);
@@ -543,6 +721,7 @@ export class TaskBridge {
           exitCode: -1,
         });
 
+        // Clean up the mapping if it exists
         if (dbTask.queuedTaskId) {
           this.taskIdMap.delete(dbTask.queuedTaskId);
         }
@@ -561,6 +740,7 @@ export class TaskBridge {
       exitCode: 143, // Standard exit code for SIGTERM (128 + 15)
     });
 
+    // Clean up the mapping if it exists
     if (dbTask.queuedTaskId) {
       this.taskIdMap.delete(dbTask.queuedTaskId);
     }
