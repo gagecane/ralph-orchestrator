@@ -6,9 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Consolidated common dependencies (`ansi-to-tui`, `url`, `jsonschema`, workspace `serde`/`tokio-tungstenite` dev-deps) into `[workspace.dependencies]` and switched `ralph-e2e` to the workspace `ralph-core` declaration to prevent version drift across crates.
+- Documented the distinction between top-level `presets/*.yml` (full multi-hat builtins exposed via `ralph init --list-presets`) and `presets/minimal/*.yml` (single-hat / per-backend starter configs loaded by explicit path) in the presets README.
+
 ### Fixed
 
 - Claude child sessions now default to `--setting-sources project,local`, preventing host user-level `~/.claude/settings.json` hooks, plugins, and MCP servers from leaking into Ralph orchestration runs. Users who want the old behavior can opt back in with `cli.args: ["--setting-sources", "user,project,local"]`.
+- `ralph emit` now writes events to the correct events file regardless of the agent's working directory. `inject_ralph_runtime_env` (cli_executor, pty_executor) reads the `.ralph/current-events` marker, resolves it to an absolute path, and exports `RALPH_EVENTS_FILE` to child backends; previously an agent that `cd`'d into a project root could resolve the events file relative to CWD and silently drop events, stalling the loop.
+- An empty `RALPH_EVENTS_FILE` environment variable is now treated as unset in `ralph emit` and wave resolution, matching the behavior when the variable is absent.
+- `LateEventRecovery::Terminate(reason)` is now preserved by the loop runner and checked alongside `check_completion_event()`, so late termination signals from backends are no longer silently dropped.
+- `TaskStore::open()` and `has_open_tasks()` now use `is_terminal()` (aligning with `has_pending_tasks()`). Failed tasks are no longer counted as open, so `verify_tasks_complete()` no longer rejects completion events indefinitely when a task failed.
 
 ## [2.9.2] - 2026-04-10
 
