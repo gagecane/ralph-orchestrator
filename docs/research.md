@@ -415,5 +415,5 @@ As Geoffrey Huntley noted: "Sometimes the simplest solution is the best solution
 - [Claude Code Plugin Guide](https://paddo.dev/blog/ralph-wiggum-autonomous-loops/) - Detailed integration walkthrough
 - [Official Plugin Source](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum) - Reference implementation
 - [Ralph Orchestrator GitHub](https://github.com/mikeyobrien/ralph-orchestrator) - This project
-- [AI Agent Comparison Study](06-analysis/comparison-matrix.md) - Agent comparison matrix
-- [Implementation Best Practices](03-best-practices/best-practices.md) - Best practices guide
+- [AI Agent Comparison Study](analysis/comparison-matrix.md) - Agent comparison matrix
+- [Implementation Best Practices](best-practices/best-practices.md) - Best practices guide

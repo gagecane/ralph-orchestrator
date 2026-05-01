@@ -125,7 +125,7 @@ Global mutation quality parsing remains anchored at **>=70%** via
 `crates/ralph-core/src/event_parser.rs`.
 
 For the scoped hooks rollout, baseline calibration is documented in
-`docs/06-analysis/hooks-mutation-baseline-2026-03-01.md` and sets an initial
+`docs/analysis/hooks-mutation-baseline-2026-03-01.md` and sets an initial
 operational gate of **>=55%** (`caught / (caught + missed)`), with timeouts and
 critical-path no-survivor checks enforced separately.
 

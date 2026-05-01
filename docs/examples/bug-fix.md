@@ -440,4 +440,4 @@ def find_target_enhanced(arr, target, return_insertion_point=False):
 
 - [Testing Examples](./testing.md)
 - [Agent Guide](../guide/agents.md)
-- [Error Handling Best Practices](../03-best-practices/best-practices.md)
+- [Error Handling Best Practices](../best-practices/best-practices.md)

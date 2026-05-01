@@ -72,7 +72,7 @@ coverage-badge-json:
 coverage-open: coverage
     open coverage/html/index.html 2>/dev/null || xdg-open coverage/html/index.html 2>/dev/null || echo "Open coverage/html/index.html manually"
 
-# Calibrated hooks mutation rollout threshold (see docs/06-analysis/hooks-mutation-baseline-2026-03-01.md)
+# Calibrated hooks mutation rollout threshold (see docs/analysis/hooks-mutation-baseline-2026-03-01.md)
 HOOKS_MUTATION_THRESHOLD := "55"
 
 # Enforced hooks mutation CI gate (threshold + critical-path no-MISS invariant)

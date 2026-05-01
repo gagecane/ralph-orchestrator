@@ -85,7 +85,7 @@ For Step 12.5 CI wiring, critical-path mutation enforcement is:
 
 Evidence from baseline artifacts:
 
-- `docs/06-analysis/hooks-mutation-baseline-2026-03-01-survivors.txt`
+- `docs/analysis/hooks-mutation-baseline-2026-03-01-survivors.txt`
   - no `MISS` lines in either critical range
   - one `TIMEOUT` line at `3475` (`wait_for_resume_if_suspended`)
 - `/tmp/hooks-mutants-baseline/mutants.out/unviable.txt`
@@ -137,7 +137,7 @@ fn test_wait_for_resume_if_suspended_prioritizes_restart_over_resume()
 
 Full actionable survivor list (all `MISS` + `TIMEOUT` entries, line-resolved):
 
-- [`docs/06-analysis/hooks-mutation-baseline-2026-03-01-survivors.txt`](./hooks-mutation-baseline-2026-03-01-survivors.txt)
+- [`docs/analysis/hooks-mutation-baseline-2026-03-01-survivors.txt`](./hooks-mutation-baseline-2026-03-01-survivors.txt)
 
 ## Step 12.6 verification gate run (2026-03-01)
 
