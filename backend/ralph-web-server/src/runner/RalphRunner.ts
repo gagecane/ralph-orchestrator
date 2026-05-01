@@ -20,39 +20,81 @@
  * - Supports cancellation via AbortSignal
  * - Graceful shutdown with SIGTERM, then SIGKILL after timeout
  * - Configurable command and arguments
- *
- * Module layout:
- * - `RalphRunnerTypes.ts`   — public interfaces (options, result, events)
- * - `RalphRunnerProcess.ts` — subprocess controller (spawn / stop / poll)
- * - `RalphRunnerResult.ts`  — pure result-building helpers
- * - `RalphRunner.ts`        — this file: state machine + event emission
  */
 
+import { spawn, ChildProcess, SpawnOptions } from "child_process";
 import { EventEmitter } from "events";
-import {
-  RunnerState,
-  isTerminalRunnerState,
-  isValidRunnerTransition,
-} from "./RunnerState";
-import { LogStream, LogCallback } from "./LogStream";
+import { RunnerState, isTerminalRunnerState, isValidRunnerTransition } from "./RunnerState";
+import { LogStream, LogEntry, LogCallback } from "./LogStream";
 import { PromptWriter, PromptContent } from "./PromptWriter";
-import { ProcessSupervisor } from "./ProcessSupervisor";
+import { ProcessSupervisor, ProcessHandle } from "./ProcessSupervisor";
 import { FileOutputStreamer } from "./FileOutputStreamer";
-import { RalphRunnerProcessController } from "./RalphRunnerProcess";
-import type { RalphRunnerOptions, RunnerResult } from "./RalphRunnerTypes";
-import {
-  buildErrorResult,
-  buildExitResult,
-  determineFinalState,
-} from "./RalphRunnerResult";
 
-// Re-export public types so existing import paths (`./RalphRunner`)
-// continue to work unchanged.
-export type {
-  RalphRunnerOptions,
-  RunnerResult,
-  RalphRunnerEvents,
-} from "./RalphRunnerTypes";
+/**
+ * Configuration options for RalphRunner
+ */
+export interface RalphRunnerOptions {
+  /** Command to execute (default: 'ralph') */
+  command?: string;
+  /** Base arguments (default: ['run']) */
+  baseArgs?: string[];
+  /** Working directory for the subprocess */
+  cwd?: string;
+  /** Environment variables (merged with process.env) */
+  env?: Record<string, string>;
+  /** Graceful stop timeout in ms before SIGKILL (default: 5000) */
+  gracefulTimeoutMs?: number;
+  /** Maximum output buffer size (default: 10MB) */
+  maxOutputSize?: number;
+  /** Shell to use (default: false - no shell) */
+  shell?: boolean;
+  /** Callback for log output */
+  onOutput?: LogCallback;
+  /** ProcessSupervisor instance (optional, creates default if not provided) */
+  supervisor?: ProcessSupervisor;
+  /** FileOutputStreamer instance (optional, creates default if not provided) */
+  outputStreamer?: FileOutputStreamer;
+  /** Task ID for process tracking (optional, generates UUID if not provided) */
+  taskId?: string;
+}
+
+/**
+ * Result of a runner execution
+ */
+export interface RunnerResult {
+  /** Final state */
+  state: RunnerState;
+  /** Exit code (if process exited normally) */
+  exitCode?: number;
+  /** Signal that killed the process (if applicable) */
+  signal?: string;
+  /** Captured stdout */
+  stdout: string;
+  /** Captured stderr */
+  stderr: string;
+  /** Combined output (interleaved by timestamp) */
+  combined: string;
+  /** Duration in milliseconds */
+  durationMs: number;
+  /** Error message (if failed) */
+  error?: string;
+}
+
+/**
+ * Events emitted by RalphRunner
+ */
+export interface RalphRunnerEvents {
+  /** State changed */
+  stateChange: (state: RunnerState, previousState: RunnerState) => void;
+  /** Output line received */
+  output: (entry: LogEntry) => void;
+  /** Process spawned */
+  spawned: (pid: number) => void;
+  /** Process completed */
+  completed: (result: RunnerResult) => void;
+  /** Error occurred */
+  error: (error: Error) => void;
+}
 
 /**
  * RalphRunner
@@ -62,12 +104,18 @@ export type {
 export class RalphRunner extends EventEmitter {
   /** Current state */
   private _state: RunnerState = RunnerState.IDLE;
+  /** Child process reference */
+  private process?: ChildProcess;
+  /** Process handle from supervisor */
+  private processHandle?: ProcessHandle;
   /** Log stream for output capture */
   private logStream: LogStream;
   /** Prompt writer for temp files */
   private promptWriter: PromptWriter;
-  /** Subprocess controller (spawn / stop / poll) */
-  private processController: RalphRunnerProcessController;
+  /** Process supervisor for detached process management */
+  private supervisor: ProcessSupervisor;
+  /** File output streamer for log file monitoring */
+  private outputStreamer: FileOutputStreamer;
   /** Current prompt file path */
   private promptFilePath?: string;
   /** Start timestamp */
@@ -79,20 +127,21 @@ export class RalphRunner extends EventEmitter {
   private readonly command: string;
   private readonly baseArgs: string[];
   private readonly cwd?: string;
+  private readonly env?: Record<string, string>;
   private readonly gracefulTimeoutMs: number;
   private readonly maxOutputSize: number;
+  private readonly shell: boolean;
   private readonly onOutput?: LogCallback;
-  private readonly supervisor: ProcessSupervisor;
-  private readonly outputStreamer: FileOutputStreamer;
 
   constructor(options: RalphRunnerOptions = {}) {
     super();
 
-    // Prevent unhandled 'error' events from crashing the process.
-    // Errors are still emitted for listeners that want them, but if no
-    // listener is attached, the error is captured in the result.
+    // Prevent unhandled 'error' events from crashing the process
+    // Errors are still emitted for listeners that want them, but
+    // if no listener is attached, the error is captured in the result
     this.on("error", () => {
-      // Intentionally empty - prevents Node.js from throwing.
+      // Intentionally empty - prevents Node.js from throwing
+      // The error is captured in handleError() and returned in RunnerResult
     });
 
     this.taskId =
@@ -100,8 +149,10 @@ export class RalphRunner extends EventEmitter {
     this.command = options.command ?? "ralph";
     this.baseArgs = options.baseArgs ?? ["run"];
     this.cwd = options.cwd;
+    this.env = options.env;
     this.gracefulTimeoutMs = options.gracefulTimeoutMs ?? 5000;
     this.maxOutputSize = options.maxOutputSize ?? 10 * 1024 * 1024;
+    this.shell = options.shell ?? false;
     this.onOutput = options.onOutput;
     this.supervisor = options.supervisor ?? new ProcessSupervisor();
     this.outputStreamer = options.outputStreamer ?? new FileOutputStreamer();
@@ -117,16 +168,6 @@ export class RalphRunner extends EventEmitter {
     });
 
     this.promptWriter = new PromptWriter();
-
-    this.processController = new RalphRunnerProcessController({
-      supervisor: this.supervisor,
-      outputStreamer: this.outputStreamer,
-      taskId: this.taskId,
-      command: this.command,
-      cwd: this.cwd ?? process.cwd(),
-      gracefulTimeoutMs: this.gracefulTimeoutMs,
-      logStream: this.logStream,
-    });
   }
 
   /**
@@ -140,7 +181,7 @@ export class RalphRunner extends EventEmitter {
    * Get the child process PID (if running)
    */
   get pid(): number | undefined {
-    return this.processController.currentHandle?.pid;
+    return this.process?.pid;
   }
 
   /**
@@ -198,20 +239,49 @@ export class RalphRunner extends EventEmitter {
       this.runResolve = resolve;
 
       try {
-        this.processController.spawn(promptText, args, {
-          onSpawned: (handle) => {
-            // Transition to RUNNING
-            this.setState(RunnerState.RUNNING);
-            this.emit("spawned", handle.pid);
-          },
-          onExit: (code, signalName) => {
-            this.handleExit(code, signalName);
-          },
+        // Spawn via ProcessSupervisor (writes to log files)
+        this.processHandle = this.supervisor.spawn(
+          this.taskId,
+          promptText,
+          args,
+          this.cwd ?? process.cwd(),
+          this.command
+        );
+
+        // Start streaming output from log files
+        this.outputStreamer.stream(this.taskId, this.processHandle.taskDir, (line, source) => {
+          // Write to LogStream for buffering
+          if (source === "stdout") {
+            this.logStream.writeStdout(Buffer.from(line + "\n"));
+          } else {
+            this.logStream.writeStderr(Buffer.from(line + "\n"));
+          }
         });
+
+        // Monitor process status by polling
+        const checkInterval = setInterval(() => {
+          if (!this.processHandle) {
+            clearInterval(checkInterval);
+            return;
+          }
+
+          // Check if process is still alive
+          if (!this.supervisor.isAlive(this.processHandle.pid)) {
+            clearInterval(checkInterval);
+            // Read final status
+            const status = this.supervisor.getStatus(this.taskId);
+            this.handleExit(status?.exitCode ?? null, (status?.signal as NodeJS.Signals) ?? null);
+          }
+        }, 500);
+
+        // Transition to RUNNING
+        this.setState(RunnerState.RUNNING);
+        this.emit("spawned", this.processHandle.pid);
 
         // Set up abort signal handler
         if (signal) {
           if (signal.aborted) {
+            // Already aborted
             this.stop();
           } else {
             signal.addEventListener("abort", () => {
@@ -232,42 +302,89 @@ export class RalphRunner extends EventEmitter {
    * @param force - If true, skip graceful shutdown and SIGKILL immediately
    */
   async stop(force: boolean = false): Promise<void> {
-    if (isTerminalRunnerState(this._state)) {
+    if (!this.processHandle || isTerminalRunnerState(this._state)) {
       return;
     }
-    this.processController.stop(force);
+
+    const signal = force ? "SIGKILL" : "SIGTERM";
+
+    try {
+      process.kill(this.processHandle.pid, signal);
+
+      if (!force) {
+        // Schedule SIGKILL if process doesn't exit
+        setTimeout(() => {
+          if (this.processHandle && !isTerminalRunnerState(this._state)) {
+            try {
+              process.kill(this.processHandle.pid, "SIGKILL");
+            } catch (err) {
+              // Process may have already exited
+            }
+          }
+        }, this.gracefulTimeoutMs);
+      }
+    } catch (err) {
+      // Process may have already exited
+    }
   }
 
   /**
    * Handle process exit
    */
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
-    // Stop output streaming.
-    this.processController.stopStreaming();
+    // Stop output streaming
+    this.outputStreamer.stop(this.taskId);
 
-    // Flush any remaining output.
+    // Flush any remaining output
     this.logStream.close();
 
-    // Clean up prompt file.
-    this.cleanupPromptFile();
+    // Clean up prompt file
+    if (this.promptFilePath) {
+      this.promptWriter.delete(this.promptFilePath);
+      this.promptFilePath = undefined;
+    }
 
-    // Determine final state and build the result.
-    const finalState = determineFinalState({ code, signal });
+    // Calculate duration
+    const durationMs = this.startedAt ? Date.now() - this.startedAt.getTime() : 0;
 
-    // Only transition if not already terminal (could have errored during spawn).
+    // Determine final state
+    let finalState: RunnerState;
+    let error: string | undefined;
+
+    if (signal === "SIGTERM" || signal === "SIGKILL") {
+      finalState = RunnerState.CANCELLED;
+    } else if (code === 0) {
+      finalState = RunnerState.COMPLETED;
+    } else {
+      finalState = RunnerState.FAILED;
+      error = `Process exited with code ${code}`;
+    }
+
+    // Only transition if not already terminal (could have errored during spawn)
     if (!isTerminalRunnerState(this._state)) {
       this.setState(finalState);
     }
 
-    const result = buildExitResult(this._state, { code, signal }, this.logStream, this.startedAt);
+    // Build result
+    const result: RunnerResult = {
+      state: this._state,
+      exitCode: code ?? undefined,
+      signal: signal ?? undefined,
+      stdout: this.logStream.getStdoutText(),
+      stderr: this.logStream.getStderrText(),
+      combined: this.logStream.getCombinedText(),
+      durationMs,
+      error,
+    };
 
-    // Clear process references.
-    this.processController.clear();
+    // Clear process reference
+    this.process = undefined;
+    this.processHandle = undefined;
 
-    // Emit completion.
+    // Emit completion
     this.emit("completed", result);
 
-    // Resolve the run() promise.
+    // Resolve the run() promise
     if (this.runResolve) {
       this.runResolve(result);
       this.runResolve = undefined;
@@ -278,46 +395,50 @@ export class RalphRunner extends EventEmitter {
    * Handle spawn/runtime errors
    */
   private handleError(err: Error): void {
-    // Stop output streaming.
-    this.processController.stopStreaming();
+    // Stop output streaming
+    this.outputStreamer.stop(this.taskId);
 
-    // Flush any output we might have.
+    // Flush any output we might have
     this.logStream.close();
 
-    // Clean up prompt file.
-    this.cleanupPromptFile();
+    // Clean up prompt file
+    if (this.promptFilePath) {
+      this.promptWriter.delete(this.promptFilePath);
+      this.promptFilePath = undefined;
+    }
 
-    // Transition to FAILED if not already terminal.
+    // Calculate duration
+    const durationMs = this.startedAt ? Date.now() - this.startedAt.getTime() : 0;
+
+    // Transition to FAILED if not already terminal
     if (!isTerminalRunnerState(this._state)) {
       this.setState(RunnerState.FAILED);
     }
 
-    // Emit error.
+    // Emit error
     this.emit("error", err);
 
-    // Build result.
-    const result = buildErrorResult(err, this.logStream, this.startedAt);
+    // Build result
+    const result: RunnerResult = {
+      state: RunnerState.FAILED,
+      stdout: this.logStream.getStdoutText(),
+      stderr: this.logStream.getStderrText(),
+      combined: this.logStream.getCombinedText(),
+      durationMs,
+      error: err.message,
+    };
 
-    // Clear process references.
-    this.processController.clear();
+    // Clear process reference
+    this.process = undefined;
+    this.processHandle = undefined;
 
-    // Emit completion.
+    // Emit completion
     this.emit("completed", result);
 
-    // Resolve the run() promise.
+    // Resolve the run() promise
     if (this.runResolve) {
       this.runResolve(result);
       this.runResolve = undefined;
-    }
-  }
-
-  /**
-   * Delete the current prompt file, if any.
-   */
-  private cleanupPromptFile(): void {
-    if (this.promptFilePath) {
-      this.promptWriter.delete(this.promptFilePath);
-      this.promptFilePath = undefined;
     }
   }
 
@@ -362,7 +483,7 @@ export class RalphRunner extends EventEmitter {
       throw new Error(`Cannot reset runner in state: ${this._state}`);
     }
 
-    this.processController.clear();
+    this.process = undefined;
     this.promptFilePath = undefined;
     this.startedAt = undefined;
     this.runResolve = undefined;
@@ -374,21 +495,25 @@ export class RalphRunner extends EventEmitter {
    * Clean up resources
    */
   dispose(): void {
-    // Force stop if running.
-    if (!isTerminalRunnerState(this._state)) {
-      this.processController.forceKill();
+    // Force stop if running
+    if (this.processHandle && !isTerminalRunnerState(this._state)) {
+      try {
+        process.kill(this.processHandle.pid, "SIGKILL");
+      } catch (err) {
+        // Process may have already exited
+      }
     }
 
-    // Stop output streaming.
-    this.processController.stopStreaming();
+    // Stop output streaming
+    this.outputStreamer.stop(this.taskId);
 
-    // Clean up prompt files.
+    // Clean up prompt files
     this.promptWriter.cleanupAll();
 
-    // Close log stream.
+    // Close log stream
     this.logStream.close();
 
-    // Remove all listeners.
+    // Remove all listeners
     this.removeAllListeners();
   }
 }
