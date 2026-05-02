@@ -531,7 +531,10 @@ mod tests {
         assert!(result.subscription_id.starts_with("sub-"));
         assert_eq!(
             result.accepted_topics,
-            vec!["task.status.changed".to_string(), "task.log.line".to_string()]
+            vec![
+                "task.status.changed".to_string(),
+                "task.log.line".to_string()
+            ]
         );
         assert!(
             result.cursor.contains('-'),
@@ -564,7 +567,10 @@ mod tests {
             )
             .expect("subscribe should succeed");
 
-        assert_eq!(result.accepted_topics, vec!["task.status.changed".to_string()]);
+        assert_eq!(
+            result.accepted_topics,
+            vec!["task.status.changed".to_string()]
+        );
     }
 
     #[test]
@@ -583,7 +589,11 @@ mod tests {
             )
             .expect_err("unknown topic should be rejected");
 
-        assert!(err.message.contains("unknown stream topic"), "got: {}", err.message);
+        assert!(
+            err.message.contains("unknown stream topic"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -667,7 +677,11 @@ mod tests {
             .expect("unsubscribe should succeed");
 
         assert!(!domain.has_subscription(&subscription_id));
-        assert!(domain.get_subscription_principal(&subscription_id).is_none());
+        assert!(
+            domain
+                .get_subscription_principal(&subscription_id)
+                .is_none()
+        );
     }
 
     #[test]
@@ -699,7 +713,11 @@ mod tests {
         let original_sequence = cursor_sequence(&original_cursor).unwrap();
 
         // Build a cursor that's newer than the current one.
-        let newer_cursor = format!("{}-{}", Utc::now().timestamp_millis(), original_sequence + 10);
+        let newer_cursor = format!(
+            "{}-{}",
+            Utc::now().timestamp_millis(),
+            original_sequence + 10
+        );
 
         domain
             .ack(StreamAckParams {
@@ -751,11 +769,7 @@ mod tests {
             })
             .expect_err("older cursor should be rejected");
 
-        assert!(
-            err.message.contains("older"),
-            "got: {}",
-            err.message
-        );
+        assert!(err.message.contains("older"), "got: {}", err.message);
     }
 
     #[test]
@@ -770,7 +784,11 @@ mod tests {
             })
             .expect_err("invalid cursor should be rejected");
 
-        assert!(err.message.contains("cursor must match"), "got: {}", err.message);
+        assert!(
+            err.message.contains("cursor must match"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -837,7 +855,10 @@ mod tests {
         let seq2 = live_rx.try_recv().unwrap().sequence;
         let seq3 = live_rx.try_recv().unwrap().sequence;
 
-        assert!(seq1 < seq2 && seq2 < seq3, "sequences should be monotonic, got {seq1} {seq2} {seq3}");
+        assert!(
+            seq1 < seq2 && seq2 < seq3,
+            "sequences should be monotonic, got {seq1} {seq2} {seq3}"
+        );
     }
 
     #[test]
@@ -1189,6 +1210,9 @@ mod tests {
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].topic, "task.status.changed");
         assert_eq!(batch.events[0].resource.id, "task-99");
-        assert_eq!(batch.events[0].payload["to"], Value::String("open".to_string()));
+        assert_eq!(
+            batch.events[0].payload["to"],
+            Value::String("open".to_string())
+        );
     }
 }

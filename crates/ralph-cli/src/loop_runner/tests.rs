@@ -136,9 +136,8 @@ static FAKE_PATH_BACKEND_SERIAL: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 #[cfg(unix)]
-static FAKE_PATH_BACKEND_BIN: std::sync::LazyLock<
-    std::sync::Mutex<Option<std::path::PathBuf>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static FAKE_PATH_BACKEND_BIN: std::sync::LazyLock<std::sync::Mutex<Option<std::path::PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[cfg(unix)]
 struct FakePathBackendsGuard {
@@ -712,10 +711,7 @@ fn test_ac13_mutation_disabled_json_output_is_inert_for_accumulator_and_downstre
     );
 
     let metadata_before_merge = accumulated_hook_metadata.clone();
-    merge_accumulated_hook_metadata_from_outcomes(
-        &mut accumulated_hook_metadata,
-        &pre_outcomes,
-    );
+    merge_accumulated_hook_metadata_from_outcomes(&mut accumulated_hook_metadata, &pre_outcomes);
     assert_eq!(accumulated_hook_metadata, metadata_before_merge);
 
     let post_outcomes = dispatch_phase_event_hooks(
@@ -734,10 +730,7 @@ fn test_ac13_mutation_disabled_json_output_is_inert_for_accumulator_and_downstre
             &accumulated_hook_metadata,
         ),
     );
-    merge_accumulated_hook_metadata_from_outcomes(
-        &mut accumulated_hook_metadata,
-        &post_outcomes,
-    );
+    merge_accumulated_hook_metadata_from_outcomes(&mut accumulated_hook_metadata, &post_outcomes);
 
     let payloads = read_hook_payload_log(&payload_log_path);
     assert_eq!(payloads.len(), 1);
@@ -807,10 +800,7 @@ fn test_ac14_mutation_enabled_updates_only_namespaced_metadata_in_downstream_pay
         HookMutationParseOutcome::Parsed { .. }
     ));
 
-    merge_accumulated_hook_metadata_from_outcomes(
-        &mut accumulated_hook_metadata,
-        &pre_outcomes,
-    );
+    merge_accumulated_hook_metadata_from_outcomes(&mut accumulated_hook_metadata, &pre_outcomes);
     assert_eq!(
         serde_json::Value::Object(accumulated_hook_metadata.clone()),
         serde_json::json!({
@@ -840,10 +830,7 @@ fn test_ac14_mutation_enabled_updates_only_namespaced_metadata_in_downstream_pay
             &accumulated_hook_metadata,
         ),
     );
-    merge_accumulated_hook_metadata_from_outcomes(
-        &mut accumulated_hook_metadata,
-        &post_outcomes,
-    );
+    merge_accumulated_hook_metadata_from_outcomes(&mut accumulated_hook_metadata, &post_outcomes);
 
     let payloads = read_hook_payload_log(&payload_log_path);
     assert_eq!(payloads.len(), 1);
@@ -1149,8 +1136,7 @@ fn test_ac15_dispatch_phase_event_hooks_non_json_mutation_warn_continues_through
 
 #[cfg(unix)]
 #[test]
-fn test_ac15_dispatch_phase_event_hooks_non_json_mutation_block_surfaces_invalid_output_reason()
-{
+fn test_ac15_dispatch_phase_event_hooks_non_json_mutation_block_surfaces_invalid_output_reason() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     let mut block_hook = hook_spec_with_command_and_on_error(
@@ -1201,8 +1187,7 @@ fn test_ac15_dispatch_phase_event_hooks_non_json_mutation_block_surfaces_invalid
 
 #[cfg(unix)]
 #[test]
-fn test_dispatch_phase_event_hooks_runtime_failure_takes_precedence_over_mutation_parse_error()
-{
+fn test_dispatch_phase_event_hooks_runtime_failure_takes_precedence_over_mutation_parse_error() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     let mut block_hook = hook_spec_with_command_and_on_error(
@@ -1417,13 +1402,7 @@ fn test_loop_start_dispatch_warn_continues_and_block_aborts() {
         &hook_engine,
         &hook_executor,
         HookPhaseEvent::PostLoopStart,
-        build_loop_start_payload_input(
-            "loop-test",
-            &loop_ctx,
-            5,
-            0,
-            Some("planner".to_string()),
-        ),
+        build_loop_start_payload_input("loop-test", &loop_ctx, 5, 0, Some("planner".to_string())),
     );
 
     assert_eq!(post_loop_start_outcomes.len(), 1);
@@ -2210,8 +2189,7 @@ fn test_dispatch_phase_event_hooks_retry_backoff_yields_to_stop_signal() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let attempts_path = temp_dir.path().join("retry-backoff-attempts.txt");
     std::fs::create_dir_all(temp_dir.path().join(".ralph")).expect("create .ralph");
-    std::fs::write(temp_dir.path().join(".ralph/stop-requested"), "")
-        .expect("write stop signal");
+    std::fs::write(temp_dir.path().join(".ralph/stop-requested"), "").expect("write stop signal");
 
     let mut events = std::collections::HashMap::new();
     events.insert(
@@ -2512,8 +2490,7 @@ fn test_dispatch_phase_event_hooks_wait_then_retry_prioritizes_stop_over_resume(
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let attempts_path = temp_dir.path().join("wait-then-retry-attempts.txt");
     std::fs::create_dir_all(temp_dir.path().join(".ralph")).expect("create .ralph");
-    std::fs::write(temp_dir.path().join(".ralph/stop-requested"), "")
-        .expect("write stop signal");
+    std::fs::write(temp_dir.path().join(".ralph/stop-requested"), "").expect("write stop signal");
     std::fs::write(temp_dir.path().join(".ralph/resume-requested"), "")
         .expect("write resume signal");
 
@@ -2987,9 +2964,8 @@ fn test_fail_if_blocking_human_interact_outcomes_surfaces_failure_context() {
         mutation_parse_outcome: HookMutationParseOutcome::Disabled,
     }];
 
-    let blocked_timeout_error =
-        fail_if_blocking_human_interact_outcomes(&blocked_timeout_outcomes)
-            .expect_err("block disposition should fail human.interact boundary");
+    let blocked_timeout_error = fail_if_blocking_human_interact_outcomes(&blocked_timeout_outcomes)
+        .expect_err("block disposition should fail human.interact boundary");
     let blocked_timeout_message = blocked_timeout_error.to_string();
     assert!(blocked_timeout_message.contains("block-timeout-hook"));
     assert!(blocked_timeout_message.contains("post.human.interact"));
@@ -3326,8 +3302,7 @@ fn test_wait_for_resume_if_suspended_prioritizes_stop_over_resume() {
     let suspend_state_store = SuspendStateStore::new(temp_dir.path());
 
     std::fs::create_dir_all(temp_dir.path().join(".ralph")).expect("create .ralph");
-    std::fs::write(temp_dir.path().join(".ralph/stop-requested"), "")
-        .expect("write stop signal");
+    std::fs::write(temp_dir.path().join(".ralph/stop-requested"), "").expect("write stop signal");
     suspend_state_store
         .write_resume_requested()
         .expect("write resume signal");
@@ -3703,8 +3678,7 @@ fn test_wave_worker_execution_mode_matches_supported_hat_backend_families() {
             "execution-mode:hat:custom",
         ),
     ] {
-        let backend =
-            CliBackend::from_hat_backend(&hat_backend).expect("supported hat backend");
+        let backend = CliBackend::from_hat_backend(&hat_backend).expect("supported hat backend");
         assert_eq!(
             backend.output_format, expected_output_format,
             "unexpected output format for {hat_backend:?}"
@@ -4403,10 +4377,7 @@ fn assert_named_backend_invocation_contract(
                 captured.args
             );
             assert_eq!(args[expected_prefix.len()], flag, "missing prompt flag");
-            assert_temp_file_prompt_instruction(
-                args[expected_prefix.len() + 1],
-                &captured.prompt,
-            );
+            assert_temp_file_prompt_instruction(args[expected_prefix.len() + 1], &captured.prompt);
         }
         PromptDeliveryExpectation::TempFilePositional => {
             assert_eq!(
@@ -4447,10 +4418,7 @@ fn assert_named_backend_invocation_contract(
 }
 
 #[cfg(unix)]
-fn assert_acp_invocation_contract(
-    captured: &CapturedAcpWaveInvocation,
-    expected_args: &[&str],
-) {
+fn assert_acp_invocation_contract(captured: &CapturedAcpWaveInvocation, expected_args: &[&str]) {
     assert_eq!(captured.command, "kiro-cli");
     assert_eq!(
         captured.args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -4597,12 +4565,8 @@ fn assert_partial_timeout_events_visible_marked(
 
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let merged_events_path = temp_dir.path().join("events.jsonl");
-    merge_wave_results_to_events_file(
-        completed,
-        &merged_events_path,
-        &["review.done".to_string()],
-    )
-    .expect("merge partial-timeout results");
+    merge_wave_results_to_events_file(completed, &merged_events_path, &["review.done".to_string()])
+        .expect("merge partial-timeout results");
 
     let merged = std::fs::read_to_string(&merged_events_path).expect("read merged events");
     let records: Vec<serde_json::Value> = merged
@@ -4983,8 +4947,7 @@ async fn test_execute_wave_hat_backend_invocation_contracts() {
     }
 
     {
-        let body =
-            invocation_capture_backend_body("hat named-with-args invocation contract ok");
+        let body = invocation_capture_backend_body("hat named-with-args invocation contract ok");
         let _fake = install_fake_path_backends(&[("opencode", body.as_str())]);
         let (completed, captured) = run_wave_for_hat_backend_with_capture(
             ralph_core::HatBackend::NamedWithArgs {
@@ -5667,10 +5630,7 @@ async fn test_execute_wave_acp_backend_invocation_contracts() {
             &captured,
             &["acp", "--model", "claude-sonnet-4", "--hat-runtime-arg"],
         );
-        emit_wave_validation_marker(
-            "invocation-contract:acp:hat:named-with-args",
-            &["backend"],
-        );
+        emit_wave_validation_marker("invocation-contract:acp:hat:named-with-args", &["backend"]);
     }
 }
 
@@ -5693,8 +5653,7 @@ async fn test_execute_wave_surfaces_named_kiro_acp_executor_error_with_synthetic
 
 #[cfg(unix)]
 #[tokio::test]
-async fn test_execute_wave_surfaces_hat_kiro_acp_timeout_without_events_with_synthetic_events()
-{
+async fn test_execute_wave_surfaces_hat_kiro_acp_timeout_without_events_with_synthetic_events() {
     let _mock = install_mock_acp_executions(vec![MockAcpExecution::timeout(vec![])]);
 
     let completed = run_wave_for_hat_backend(
@@ -6262,9 +6221,9 @@ fn test_merge_wave_results_to_events_file_synthesizes_failure_events() {
     }));
     assert!(records.iter().any(|record| {
         record["topic"] == "review.audit"
-            && record["payload"].as_str().is_some_and(|payload| {
-                payload.contains("Error: PTY spawn failed: missing-worker")
-            })
+            && record["payload"]
+                .as_str()
+                .is_some_and(|payload| payload.contains("Error: PTY spawn failed: missing-worker"))
     }));
     emit_wave_validation_marker(
         "merge-wave-results:synthetic-failure-events",
@@ -6769,8 +6728,7 @@ fn test_recover_late_events_before_fallback_honors_completion() {
     .expect("write completion event");
     events_file.flush().expect("flush completion event");
 
-    let outcome =
-        recover_late_events_before_fallback(&mut event_loop).expect("recover completion");
+    let outcome = recover_late_events_before_fallback(&mut event_loop).expect("recover completion");
     assert_eq!(
         outcome,
         LateEventRecovery::Terminate(TerminationReason::CompletionPromise)
@@ -6803,8 +6761,7 @@ fn test_recover_late_events_before_fallback_polls_for_delayed_completion() {
         events_file.flush().expect("flush delayed completion event");
     });
 
-    let outcome =
-        recover_late_events_before_fallback(&mut event_loop).expect("recover completion");
+    let outcome = recover_late_events_before_fallback(&mut event_loop).expect("recover completion");
     writer.join().expect("join delayed event writer");
 
     assert_eq!(

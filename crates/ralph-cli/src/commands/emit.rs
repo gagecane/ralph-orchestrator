@@ -1,7 +1,9 @@
 //! `ralph emit` — emit an event to the current run's events file with proper JSON formatting.
 
 use crate::display::colors;
-use crate::{ColorMode, resolve_marker_target, resolve_workspace_root, urgent_steer_path_from_workspace};
+use crate::{
+    ColorMode, resolve_marker_target, resolve_workspace_root, urgent_steer_path_from_workspace,
+};
 use anyhow::{Context, Result};
 use clap::Parser;
 use ralph_core::UrgentSteerStore;
@@ -44,11 +46,7 @@ pub fn run(color_mode: ColorMode, args: EmitArgs) -> Result<()> {
     run_with_root(color_mode, args, None)
 }
 
-pub fn run_with_root(
-    color_mode: ColorMode,
-    args: EmitArgs,
-    root: Option<&PathBuf>,
-) -> Result<()> {
+pub fn run_with_root(color_mode: ColorMode, args: EmitArgs, root: Option<&PathBuf>) -> Result<()> {
     let use_colors = color_mode.should_use_colors();
     let workspace_root = resolve_workspace_root(root);
     let current_events_marker = workspace_root.join(".ralph/current-events");

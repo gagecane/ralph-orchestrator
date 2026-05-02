@@ -507,7 +507,10 @@ mod tests {
             "expected wss:// scheme, got {url}"
         );
         assert!(url.contains("api.example.com"), "missing host in {url}");
-        assert!(url.contains("subscriptionId=sub-xyz"), "missing id in {url}");
+        assert!(
+            url.contains("subscriptionId=sub-xyz"),
+            "missing id in {url}"
+        );
     }
 
     #[test]
@@ -800,7 +803,8 @@ mod tests {
                     let method = parts.next().unwrap_or("").to_string();
                     let path = parts.next().unwrap_or("").to_string();
 
-                    let body_bytes_in = &buf[body_start..body_start + content_length.min(buf.len().saturating_sub(body_start))];
+                    let body_bytes_in = &buf[body_start
+                        ..body_start + content_length.min(buf.len().saturating_sub(body_start))];
                     let body_json: Value =
                         serde_json::from_slice(body_bytes_in).unwrap_or(Value::Null);
 
@@ -928,12 +932,17 @@ mod tests {
         let server = MockServer::start(1, ok_envelope(json!({}))).await;
         let client = RpcClient::new(&server.base_url).unwrap();
 
-        client.call("task.create", json!({ "title": "x" })).await.unwrap();
+        client
+            .call("task.create", json!({ "title": "x" }))
+            .await
+            .unwrap();
 
         let captured = server.captured().await;
         let body = &captured[0].body;
         let meta = body.get("meta").expect("meta required for mutating method");
-        let idem = meta["idempotencyKey"].as_str().expect("idempotencyKey string");
+        let idem = meta["idempotencyKey"]
+            .as_str()
+            .expect("idempotencyKey string");
         assert!(
             idem.starts_with("idem-tui-task-create-"),
             "idempotency key format wrong: {idem}"
@@ -958,11 +967,7 @@ mod tests {
     #[tokio::test]
     async fn call_errors_when_response_has_neither_result_nor_error() {
         // Envelope with no `result` and no `error` fields.
-        let server = MockServer::start(
-            1,
-            json!({ "apiVersion": "v1", "id": "resp-1" }),
-        )
-        .await;
+        let server = MockServer::start(1, json!({ "apiVersion": "v1", "id": "resp-1" })).await;
         let client = RpcClient::new(&server.base_url).unwrap();
 
         let err = client.call("task.list", json!({})).await.unwrap_err();
@@ -1028,11 +1033,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_get_returns_raw_result_value() {
-        let server = MockServer::start(
-            1,
-            ok_envelope(json!({ "config": { "model": "claude" } })),
-        )
-        .await;
+        let server =
+            MockServer::start(1, ok_envelope(json!({ "config": { "model": "claude" } }))).await;
         let client = RpcClient::new(&server.base_url).unwrap();
 
         let v = client.config_get().await.unwrap();

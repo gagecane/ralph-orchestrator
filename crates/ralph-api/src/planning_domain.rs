@@ -632,7 +632,14 @@ mod tests {
 
     #[test]
     fn validate_session_id_rejects_invalid_characters() {
-        for candidate in ["abc/def", "abc def", "abc.def", "abc;def", "../sneaky", "abc\u{00e9}"] {
+        for candidate in [
+            "abc/def",
+            "abc def",
+            "abc.def",
+            "abc;def",
+            "../sneaky",
+            "abc\u{00e9}",
+        ] {
             let err =
                 validate_session_id(candidate).expect_err(&format!("should reject {candidate}"));
             assert_eq!(err.code, RpcErrorCode::InvalidParams, "for {candidate}");
@@ -643,7 +650,10 @@ mod tests {
     fn validate_session_id_error_carries_session_id_details() {
         let err = validate_session_id("bad id").expect_err("spaces are invalid");
         let details = err.details.expect("details set");
-        assert_eq!(details.get("sessionId").and_then(|v| v.as_str()), Some("bad id"));
+        assert_eq!(
+            details.get("sessionId").and_then(|v| v.as_str()),
+            Some("bad id")
+        );
     }
 
     // ----- is_invalid_filename -----
@@ -747,7 +757,10 @@ mod tests {
         let err = planning_session_not_found_error("abc");
         assert_eq!(err.code, RpcErrorCode::PlanningSessionNotFound);
         let details = err.details.expect("details");
-        assert_eq!(details.get("sessionId").and_then(|v| v.as_str()), Some("abc"));
+        assert_eq!(
+            details.get("sessionId").and_then(|v| v.as_str()),
+            Some("abc")
+        );
     }
 
     // ----- PlanningDomain::new -----
@@ -756,7 +769,10 @@ mod tests {
     fn new_points_sessions_dir_inside_workspace() {
         let temp = TempDir::new().expect("tempdir");
         let domain = PlanningDomain::new(temp.path());
-        assert_eq!(domain.sessions_dir, temp.path().join(".ralph/planning-sessions"));
+        assert_eq!(
+            domain.sessions_dir,
+            temp.path().join(".ralph/planning-sessions")
+        );
     }
 
     // ----- list -----
@@ -777,7 +793,9 @@ mod tests {
 
         // Valid session.
         let valid = domain
-            .start(PlanningStartParams { prompt: "Valid".into() })
+            .start(PlanningStartParams {
+                prompt: "Valid".into(),
+            })
             .expect("start");
 
         // Stray file (not a directory) — should be skipped silently.
@@ -833,7 +851,9 @@ mod tests {
         domain.ensure_sessions_dir().unwrap();
 
         let record = domain
-            .start(PlanningStartParams { prompt: "My plan".into() })
+            .start(PlanningStartParams {
+                prompt: "My plan".into(),
+            })
             .expect("start");
 
         // Append two conversation entries.
@@ -883,7 +903,9 @@ mod tests {
         let (_temp, mut domain) = domain();
 
         let record = domain
-            .start(PlanningStartParams { prompt: "Hello".into() })
+            .start(PlanningStartParams {
+                prompt: "Hello".into(),
+            })
             .expect("start");
 
         assert_eq!(record.prompt, "Hello");
@@ -923,7 +945,9 @@ mod tests {
     fn get_returns_detail_with_conversation_and_artifacts_and_completed_at() {
         let (_temp, mut domain) = domain();
         let record = domain
-            .start(PlanningStartParams { prompt: "Prompt".into() })
+            .start(PlanningStartParams {
+                prompt: "Prompt".into(),
+            })
             .expect("start");
 
         // Add conversation entries (one prompt, one other).
@@ -1141,7 +1165,10 @@ mod tests {
             .start(PlanningStartParams { prompt: "P".into() })
             .expect("start");
         fs::write(
-            domain.session_dir(&record.id).join("artifacts").join("plan.md"),
+            domain
+                .session_dir(&record.id)
+                .join("artifacts")
+                .join("plan.md"),
             "# plan body",
         )
         .unwrap();
@@ -1200,7 +1227,10 @@ mod tests {
             .expect("start");
         // Even if we write the file on disk, the API must not expose hidden names.
         fs::write(
-            domain.session_dir(&record.id).join("artifacts").join(".secret"),
+            domain
+                .session_dir(&record.id)
+                .join("artifacts")
+                .join(".secret"),
             "shh",
         )
         .unwrap();
@@ -1278,7 +1308,10 @@ mod tests {
         let target = domain.session_dir(&record.id).join("secret.txt");
         fs::write(&target, "secret").unwrap();
 
-        let link = domain.session_dir(&record.id).join("artifacts").join("link.md");
+        let link = domain
+            .session_dir(&record.id)
+            .join("artifacts")
+            .join("link.md");
         symlink(&target, &link).unwrap();
 
         let err = domain
@@ -1388,7 +1421,10 @@ mod tests {
         fs::write(&target, "t").unwrap();
         symlink(&target, artifacts.join("link.md")).unwrap();
 
-        assert_eq!(domain.read_artifacts(&record.id), vec!["real.md".to_string()]);
+        assert_eq!(
+            domain.read_artifacts(&record.id),
+            vec!["real.md".to_string()]
+        );
     }
 
     #[test]

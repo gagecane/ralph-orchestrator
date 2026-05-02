@@ -6,20 +6,17 @@
 
 use anyhow::{Context, Result};
 use ralph_adapters::{
-    AcpExecutor, CliBackend, CliExecutor,
-    ConsoleStreamHandler, JsonRpcStreamHandler,
-    OutputFormat as BackendOutputFormat,
-    PrettyStreamHandler, PtyConfig, PtyExecutor, QuietStreamHandler,
-    TuiStreamHandler,
+    AcpExecutor, CliBackend, CliExecutor, ConsoleStreamHandler, JsonRpcStreamHandler,
+    OutputFormat as BackendOutputFormat, PrettyStreamHandler, PtyConfig, PtyExecutor,
+    QuietStreamHandler, TuiStreamHandler,
 };
 use ralph_core::diagnostics::{HookDisposition, HookRunTelemetryEntry};
 use ralph_core::{
     CompletionAction, EventLogger, EventLoop, EventParser, EventRecord, HookEngine, HookExecutor,
-    HookExecutorContract, HookMutationConfig, HookOnError, HookPayloadBuilderInput,
-    HookPhaseEvent, HookRunRequest, HookRunResult, HookSuspendMode,
-    LoopCompletionHandler, LoopContext, LoopHistory, LoopRegistry, MergeQueue, RalphConfig, Record,
-    SessionRecorder, SummaryWriter, SuspendStateRecord, SuspendStateStore, TerminationReason,
-    UrgentSteerStore,
+    HookExecutorContract, HookMutationConfig, HookOnError, HookPayloadBuilderInput, HookPhaseEvent,
+    HookRunRequest, HookRunResult, HookSuspendMode, LoopCompletionHandler, LoopContext,
+    LoopHistory, LoopRegistry, MergeQueue, RalphConfig, Record, SessionRecorder, SummaryWriter,
+    SuspendStateRecord, SuspendStateStore, TerminationReason, UrgentSteerStore,
 };
 use ralph_proto::{Event, GuidanceTarget, HatId, RpcEvent, RpcState, RpcTaskCounts};
 use ralph_tui::Tui;
@@ -31,16 +28,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::display::{
-    build_tui_hat_map, print_iteration_separator, print_termination,
-};
+use crate::display::{build_tui_hat_map, print_iteration_separator, print_termination};
 use crate::process_management;
 use crate::rpc_stdin::{GuidanceMessage, RpcDispatcher, run_stdin_reader, run_stdout_emitter};
 use crate::{ColorMode, Verbosity};
 
 mod merge_queue;
-pub use merge_queue::process_pending_merges_cli;
 use merge_queue::process_pending_merges;
+pub use merge_queue::process_pending_merges_cli;
 #[cfg(test)]
 use merge_queue::process_pending_merges_with_command;
 
@@ -48,10 +43,9 @@ mod wave;
 use wave::handle_wave_events;
 #[cfg(test)]
 use wave::{
-    MOCK_ACP_EXECUTIONS, MOCK_ACP_EXECUTION_SERIAL, MockAcpExecution,
-    WaveWorkerExecutionMode, execute_wave, extract_readable_delta,
-    merge_wave_results_to_events_file, run_wave_worker_acp, run_wave_worker_pty,
-    wave_worker_execution_mode,
+    MOCK_ACP_EXECUTION_SERIAL, MOCK_ACP_EXECUTIONS, MockAcpExecution, WaveWorkerExecutionMode,
+    execute_wave, extract_readable_delta, merge_wave_results_to_events_file, run_wave_worker_acp,
+    run_wave_worker_pty, wave_worker_execution_mode,
 };
 
 mod payload;
@@ -68,22 +62,18 @@ use late_events::{
 };
 
 mod helpers;
-use helpers::{
-    check_planning_session_responses, get_last_commit_info, resolve_prompt_content,
-};
+use helpers::{check_planning_session_responses, get_last_commit_info, resolve_prompt_content};
 #[cfg(test)]
-use helpers::{
-    check_planning_session_responses_for_session, get_last_commit_info_with_cmd,
-};
+use helpers::{check_planning_session_responses_for_session, get_last_commit_info_with_cmd};
 
 mod output;
-use output::normalize_cli_output_for_parsing;
 #[cfg(test)]
 use output::detect_solo_output_completion;
+use output::normalize_cli_output_for_parsing;
 
 mod start;
-pub use start::start_loop;
 use start::create_robot_service;
+pub use start::start_loop;
 
 /// Outcome of executing a prompt via PTY or CLI executor.
 pub(crate) struct ExecutionOutcome {

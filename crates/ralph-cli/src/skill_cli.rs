@@ -376,7 +376,10 @@ mod tests {
         let item = SkillListItem::from(&skill);
 
         assert_eq!(item.source, "file");
-        assert_eq!(item.path.as_deref(), Some(path.display().to_string().as_str()));
+        assert_eq!(
+            item.path.as_deref(),
+            Some(path.display().to_string().as_str())
+        );
     }
 
     #[test]
@@ -552,11 +555,7 @@ mod tests {
     #[test]
     fn test_load_config_reads_workspace_ralph_yml() {
         let tmp = TempDir::new().expect("tmp");
-        std::fs::write(
-            tmp.path().join("ralph.yml"),
-            "cli:\n  backend: kiro\n",
-        )
-        .expect("write");
+        std::fs::write(tmp.path().join("ralph.yml"), "cli:\n  backend: kiro\n").expect("write");
 
         let config = load_config(tmp.path());
         assert_eq!(config.cli.backend, "kiro");

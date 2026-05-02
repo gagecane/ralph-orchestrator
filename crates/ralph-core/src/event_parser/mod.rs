@@ -29,9 +29,9 @@ pub use parser::EventParser;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::extraction::extract_first_number;
     use super::parser::strip_event_tags;
+    use super::*;
 
     #[test]
     fn test_parse_single_event() {

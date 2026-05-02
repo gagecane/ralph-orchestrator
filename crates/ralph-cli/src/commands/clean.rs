@@ -19,11 +19,7 @@ pub struct CleanArgs {
     pub diagnostics: bool,
 }
 
-pub fn run(
-    config_sources: &[ConfigSource],
-    color_mode: ColorMode,
-    args: CleanArgs,
-) -> Result<()> {
+pub fn run(config_sources: &[ConfigSource], color_mode: ColorMode, args: CleanArgs) -> Result<()> {
     let use_colors = color_mode.should_use_colors();
 
     // If --diagnostics flag is set, clean diagnostics directory

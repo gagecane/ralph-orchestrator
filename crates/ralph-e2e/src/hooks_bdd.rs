@@ -1054,9 +1054,7 @@ fn assert_workspace_source_contains_any(
     required_snippets: &[(&str, &str)],
 ) -> Result<(), String> {
     if relative_paths.is_empty() {
-        return Err(
-            "assert_workspace_source_contains_any called with no paths".to_string(),
-        );
+        return Err("assert_workspace_source_contains_any called with no paths".to_string());
     }
 
     let mut combined = String::new();
@@ -2730,9 +2728,7 @@ mod tests {
         assert!(
             result
                 .message
-                .contains(
-                    "source evidence assertion failed for crates/ralph-core/src/config.rs"
-                )
+                .contains("source evidence assertion failed for crates/ralph-core/src/config.rs")
         );
         assert!(
             result

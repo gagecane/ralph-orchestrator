@@ -545,13 +545,7 @@ mod tests {
     fn invoke_method_dispatches_system_health() {
         let (runtime, _workspace) = test_runtime();
         let result = runtime
-            .invoke_method(
-                "req-1",
-                "system.health",
-                json!({}),
-                "trusted_local",
-                None,
-            )
+            .invoke_method("req-1", "system.health", json!({}), "trusted_local", None)
             .expect("system.health should succeed");
         assert_eq!(result["status"], "ok");
     }
@@ -581,13 +575,7 @@ mod tests {
         // validation (which requires meta.idempotencyKey for mutations) rejects
         // the request before domain dispatch.
         let err = runtime
-            .invoke_method(
-                "req-3",
-                "task.clear",
-                json!({}),
-                "trusted_local",
-                None,
-            )
+            .invoke_method("req-3", "task.clear", json!({}), "trusted_local", None)
             .expect_err("mutation without idempotency key should fail");
         assert_eq!(err.code, RpcErrorCode::InvalidParams);
         assert_eq!(err.method.as_deref(), Some("task.clear"));

@@ -16,9 +16,8 @@
 
 use anyhow::{Context, Result};
 use ralph_adapters::{
-    AcpExecutor, CliBackend, CopilotStreamParser,
-    OutputFormat as BackendOutputFormat, PiAssistantEvent, PiContentBlock, PiStreamEvent,
-    PiStreamParser, StreamHandler,
+    AcpExecutor, CliBackend, CopilotStreamParser, OutputFormat as BackendOutputFormat,
+    PiAssistantEvent, PiContentBlock, PiStreamEvent, PiStreamParser, StreamHandler,
 };
 use ralph_core::LoopContext;
 use ralph_proto::RpcEvent;
@@ -31,10 +30,7 @@ use tracing::{info, warn};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-use crate::display::{
-    print_wave_header, print_wave_summary, print_wave_worker_done,
-};
-
+use crate::display::{print_wave_header, print_wave_summary, print_wave_worker_done};
 
 /// Push a styled line to a TUI wave worker's output buffer.
 fn push_to_wave_worker_buffer(
@@ -523,7 +519,9 @@ pub(super) enum WaveWorkerExecutionMode {
     Acp,
 }
 
-pub(super) fn wave_worker_execution_mode(output_format: BackendOutputFormat) -> WaveWorkerExecutionMode {
+pub(super) fn wave_worker_execution_mode(
+    output_format: BackendOutputFormat,
+) -> WaveWorkerExecutionMode {
     match output_format {
         BackendOutputFormat::Acp => WaveWorkerExecutionMode::Acp,
         _ => WaveWorkerExecutionMode::Pty,
@@ -1075,7 +1073,10 @@ fn truncate_wave_worker_preview(text: &str) -> String {
 }
 
 /// Extract a human-readable text delta from a single stdout line.
-pub(super) fn extract_readable_delta(line: &str, output_format: BackendOutputFormat) -> Option<String> {
+pub(super) fn extract_readable_delta(
+    line: &str,
+    output_format: BackendOutputFormat,
+) -> Option<String> {
     match output_format {
         BackendOutputFormat::Text | BackendOutputFormat::Acp => Some(format!("{line}\n")),
         BackendOutputFormat::StreamJson => {

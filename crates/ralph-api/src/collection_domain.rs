@@ -463,10 +463,7 @@ hats:
         assert_eq!(node.data.name, "Planner");
         assert_eq!(node.data.triggers_on, vec!["task.start".to_string()]);
         assert_eq!(node.data.publishes, vec!["task.ready".to_string()]);
-        assert_eq!(
-            node.data.instructions.as_deref(),
-            Some("Plan carefully")
-        );
+        assert_eq!(node.data.instructions.as_deref(), Some("Plan carefully"));
     }
 
     #[test]

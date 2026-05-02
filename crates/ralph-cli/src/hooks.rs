@@ -465,7 +465,10 @@ mod tests {
     #[test]
     fn resolve_hook_cwd_uses_workspace_root_when_hook_has_no_cwd() {
         let workspace = Path::new("/workspace");
-        assert_eq!(resolve_hook_cwd(workspace, None), PathBuf::from("/workspace"));
+        assert_eq!(
+            resolve_hook_cwd(workspace, None),
+            PathBuf::from("/workspace")
+        );
     }
 
     #[test]
@@ -569,12 +572,8 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let resolved = resolve_hook_command(
-            &script.to_string_lossy(),
-            Path::new("/tmp"),
-            None,
-        )
-        .expect("absolute executable should resolve");
+        let resolved = resolve_hook_command(&script.to_string_lossy(), Path::new("/tmp"), None)
+            .expect("absolute executable should resolve");
         assert_eq!(resolved, script);
     }
 
@@ -583,12 +582,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let missing = temp.path().join("nope.sh");
 
-        let err = resolve_hook_command(
-            &missing.to_string_lossy(),
-            Path::new("/tmp"),
-            None,
-        )
-        .expect_err("missing absolute command should fail");
+        let err = resolve_hook_command(&missing.to_string_lossy(), Path::new("/tmp"), None)
+            .expect_err("missing absolute command should fail");
         assert!(err.contains("does not exist"), "err: {err}");
     }
 
@@ -602,12 +597,8 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let err = resolve_hook_command(
-            &script.to_string_lossy(),
-            Path::new("/tmp"),
-            None,
-        )
-        .expect_err("non-executable absolute command should fail");
+        let err = resolve_hook_command(&script.to_string_lossy(), Path::new("/tmp"), None)
+            .expect_err("non-executable absolute command should fail");
         assert!(err.contains("not executable"), "err: {err}");
     }
 

@@ -897,11 +897,7 @@ mod tests {
     fn dispatch_task_list_rejects_malformed_params() {
         let (runtime, _ws) = test_runtime();
         // `includeArchived` is Option<bool>; passing an int should fail deserialization.
-        let request = req(
-            "t-list-bad",
-            "task.list",
-            json!({ "includeArchived": 123 }),
-        );
+        let request = req("t-list-bad", "task.list", json!({ "includeArchived": 123 }));
         let err = runtime
             .dispatch(&request, "trusted_local")
             .expect_err("malformed params should fail");
@@ -1020,11 +1016,7 @@ mod tests {
         let content = "version: 1\nname: test\n";
         let updated = runtime
             .dispatch(
-                &req(
-                    "c-u",
-                    "config.update",
-                    json!({ "content": content }),
-                ),
+                &req("c-u", "config.update", json!({ "content": content })),
                 "trusted_local",
             )
             .expect("config.update should succeed");
@@ -1047,7 +1039,11 @@ mod tests {
         // bare scalar counts as invalid too.
         let err = runtime
             .dispatch(
-                &req("c-bad", "config.update", json!({ "content": "just a string" })),
+                &req(
+                    "c-bad",
+                    "config.update",
+                    json!({ "content": "just a string" }),
+                ),
                 "trusted_local",
             )
             .expect_err("non-mapping YAML should be rejected");
@@ -1095,10 +1091,7 @@ mod tests {
     fn dispatch_collection_list_is_empty_on_fresh_workspace() {
         let (runtime, _ws) = test_runtime();
         let result = runtime
-            .dispatch(
-                &req("col-l", "collection.list", json!({})),
-                "trusted_local",
-            )
+            .dispatch(&req("col-l", "collection.list", json!({})), "trusted_local")
             .expect("collection.list should dispatch");
         assert!(result["collections"].is_array());
         assert_eq!(result["collections"].as_array().unwrap().len(), 0);
@@ -1153,11 +1146,7 @@ mod tests {
         let (runtime, _ws) = test_runtime();
         let created = runtime
             .dispatch(
-                &req(
-                    "col-c",
-                    "collection.create",
-                    json!({ "name": "to-delete" }),
-                ),
+                &req("col-c", "collection.create", json!({ "name": "to-delete" })),
                 "trusted_local",
             )
             .expect("collection.create");
@@ -1211,7 +1200,12 @@ mod tests {
                 "alice",
             )
             .expect("stream.subscribe should dispatch");
-        assert!(result["subscriptionId"].as_str().unwrap().starts_with("sub-"));
+        assert!(
+            result["subscriptionId"]
+                .as_str()
+                .unwrap()
+                .starts_with("sub-")
+        );
         assert_eq!(
             result["acceptedTopics"].as_array().unwrap()[0],
             "task.status.changed"
@@ -1428,11 +1422,7 @@ mod tests {
         // priority must fit in u8; a huge value should quietly become None
         // (the schema layer would normally catch this, but the parser itself
         // uses a best-effort TryFrom).
-        let request = req(
-            "u-7",
-            "task.update",
-            json!({ "id": "x", "priority": 9999 }),
-        );
+        let request = req("u-7", "task.update", json!({ "id": "x", "priority": 9999 }));
         let input = parse_task_update_input(&request).expect("huge priority should still parse");
         assert!(
             input.priority.is_none(),

@@ -1,7 +1,7 @@
 //! `ralph events` — view event history for debugging.
 
-use crate::{ColorMode, OutputFormat, display, resolve_marker_target, resolve_workspace_root};
 use crate::display::colors;
+use crate::{ColorMode, OutputFormat, display, resolve_marker_target, resolve_workspace_root};
 use anyhow::Result;
 use clap::Parser;
 use ralph_core::EventHistory;
