@@ -133,7 +133,7 @@ describe("TaskInput preset dropdown", () => {
   });
 
   describe("task creation with preset", () => {
-    it("calls task.create mutation with task data when created", () => {
+    it("calls task.create mutation with task data and default preset", () => {
       // Given: TaskInput component is rendered
       render(<TaskInput />, { wrapper: createTestWrapper() });
 
@@ -145,29 +145,38 @@ describe("TaskInput preset dropdown", () => {
       const submitButton = screen.getByRole("button", { name: /create task/i });
       fireEvent.click(submitButton);
 
-      // Then: The mutation should be called with task data
+      // Then: The mutation should be called with task data including the default preset
       expect(mockMutate).toHaveBeenCalledWith(
         expect.objectContaining({
           title: "Implement new feature",
           status: "open",
           priority: 2,
+          preset: "default",
         })
       );
     });
 
-    it("allows preset selection (UI-only, not yet sent to backend)", () => {
+    it("passes the selected preset to the task.create mutation", () => {
       // Given: TaskInput component is rendered
       render(<TaskInput />, { wrapper: createTestWrapper() });
 
-      // When: User selects a preset
+      // When: User selects a non-default preset
       const presetDropdown = screen.getByRole("combobox", { name: /preset/i });
       fireEvent.change(presetDropdown, { target: { value: "planning" } });
 
-      // Then: The selected preset should be shown in the dropdown
-      expect(presetDropdown).toHaveValue("planning");
+      // And: User enters task description and submits
+      const textarea = screen.getByRole("textbox", { name: /task description/i });
+      fireEvent.change(textarea, { target: { value: "Plan the quarter" } });
+      const submitButton = screen.getByRole("button", { name: /create task/i });
+      fireEvent.click(submitButton);
 
-      // Note: Preset is currently stored in UI state but not passed to backend
-      // TODO: Add preset field to task.create schema when backend supports it
+      // Then: The mutation should be called with the selected preset
+      expect(mockMutate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Plan the quarter",
+          preset: "planning",
+        })
+      );
     });
   });
 
