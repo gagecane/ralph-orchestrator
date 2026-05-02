@@ -1,5 +1,7 @@
 # Rust
 /target/
+# rust-analyzer flycheck artifacts (created under any package dir)
+**/target/rust-analyzer/
 
 # Test configs with secrets
 ralph.test.yml
