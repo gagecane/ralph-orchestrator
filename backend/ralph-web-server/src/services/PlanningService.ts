@@ -123,6 +123,11 @@ function toFrontendStatus(status: SessionStatus): string {
   if (status === SessionStatus.WaitingForInput) {
     return "paused";
   }
+  // The frontend has no dedicated "timed_out" state — treat it as a failure
+  // so the existing failure UI handles it without a new code path.
+  if (status === SessionStatus.TimedOut) {
+    return "failed";
+  }
   return status;
 }
 
@@ -165,14 +170,25 @@ export class PlanningService {
   private readonly runningProcesses = new Map<string, ChildProcess>();
   private readonly eventPollers = new Map<string, NodeJS.Timeout>();
   private readonly processedEventTimestamps = new Map<string, Set<string>>();
+  /**
+   * Pending per-session timeouts that abort a ralph run after
+   * `defaultTimeoutSeconds` elapses. The handle is cleared when the process
+   * exits cleanly so we don't leak timers or kill freshly-spawned reruns.
+   */
+  private readonly sessionTimeouts = new Map<string, NodeJS.Timeout>();
+  /**
+   * Sessions whose most-recent process was killed by the timeout watchdog.
+   * We track this because by the time the child 'exit' event fires, we've
+   * already issued SIGTERM and want to record `timed_out` rather than the
+   * exit handler's default `failed`.
+   */
+  private readonly timedOutSessions = new Set<string>();
 
   constructor(options: PlanningServiceOptions) {
     this.workspaceRoot = options.workspaceRoot;
     this.ralphPath = options.ralphPath ?? "ralph";
     this.sessionsDir = path.join(this.workspaceRoot, ".ralph", "planning-sessions");
     this.defaultTimeoutSeconds = options.defaultTimeoutSeconds ?? 300;
-    // TODO: use defaultTimeoutSeconds for request timeout handling
-    void this.defaultTimeoutSeconds;
   }
 
   /**
@@ -346,6 +362,36 @@ export class PlanningService {
     // Track the process
     this.runningProcesses.set(sessionId, ralphProcess);
 
+    // Start the request-timeout watchdog. If the ralph process is still
+    // running after `defaultTimeoutSeconds`, send SIGTERM and flag the
+    // session as timed out so the exit handler records the right status.
+    // Zero or negative timeouts disable the watchdog (useful in tests).
+    if (this.defaultTimeoutSeconds > 0) {
+      const timeoutMs = this.defaultTimeoutSeconds * 1000;
+      const handle = setTimeout(() => {
+        // Only act if this process is still the active one for the session.
+        const current = this.runningProcesses.get(sessionId);
+        if (!current || current !== ralphProcess) {
+          return;
+        }
+        console.warn(
+          `[PlanningService:${sessionId}] ralph exceeded ${this.defaultTimeoutSeconds}s timeout — terminating`,
+        );
+        this.timedOutSessions.add(sessionId);
+        try {
+          current.kill("SIGTERM");
+        } catch (err) {
+          console.error(`[PlanningService:${sessionId}] Failed to send SIGTERM:`, err);
+        }
+      }, timeoutMs);
+      // Don't let the timeout keep the Node.js event loop alive on its own —
+      // process lifecycle should drive shutdown, not pending timers.
+      if (typeof handle.unref === "function") {
+        handle.unref();
+      }
+      this.sessionTimeouts.set(sessionId, handle);
+    }
+
     // Initialize processed events tracking for this session
     this.processedEventTimestamps.set(sessionId, new Set());
 
@@ -367,9 +413,10 @@ export class PlanningService {
     ralphProcess.on("exit", (code, signal) => {
       console.log(`[PlanningService:${sessionId}] ralph exited: code=${code}, signal=${signal}`);
       this.runningProcesses.delete(sessionId);
+      this.clearSessionTimeout(sessionId);
       this.stopEventPolling(sessionId);
 
-      // Mark session as completed or failed
+      // Mark session as completed, timed out, or failed
       this.updateSessionStatusOnExit(sessionId, code);
     });
 
@@ -377,8 +424,20 @@ export class PlanningService {
     ralphProcess.on("error", (err) => {
       console.error(`[PlanningService:${sessionId}] ralph error:`, err);
       this.runningProcesses.delete(sessionId);
+      this.clearSessionTimeout(sessionId);
       this.stopEventPolling(sessionId);
     });
+  }
+
+  /**
+   * Clear any pending timeout watchdog for a session.
+   */
+  private clearSessionTimeout(sessionId: string): void {
+    const handle = this.sessionTimeouts.get(sessionId);
+    if (handle) {
+      clearTimeout(handle);
+      this.sessionTimeouts.delete(sessionId);
+    }
   }
 
   /**
@@ -501,7 +560,15 @@ export class PlanningService {
    * Update session status when Ralph exits.
    */
   private async updateSessionStatusOnExit(sessionId: string, exitCode: number | null): Promise<void> {
-    const newStatus = exitCode === 0 ? SessionStatus.Completed : SessionStatus.Failed;
+    // If the timeout watchdog fired for this session, surface that state
+    // instead of a generic failure so callers can tell the two apart.
+    let newStatus: SessionStatus;
+    if (this.timedOutSessions.has(sessionId)) {
+      this.timedOutSessions.delete(sessionId);
+      newStatus = SessionStatus.TimedOut;
+    } else {
+      newStatus = exitCode === 0 ? SessionStatus.Completed : SessionStatus.Failed;
+    }
     await this.updateSessionStatus(sessionId, newStatus);
   }
 
@@ -548,6 +615,8 @@ export class PlanningService {
       process.kill("SIGTERM");
       this.runningProcesses.delete(sessionId);
     }
+    this.clearSessionTimeout(sessionId);
+    this.timedOutSessions.delete(sessionId);
 
     // Remove session directory recursively
     await fs.rm(sessionDir, { recursive: true, force: true });
@@ -628,6 +697,10 @@ export class PlanningService {
     if (process) {
       process.kill("SIGTERM");
       this.runningProcesses.delete(sessionId);
+      this.clearSessionTimeout(sessionId);
+      // A user-initiated stop isn't a timeout — make sure we don't
+      // mis-report a subsequent reuse of this session id.
+      this.timedOutSessions.delete(sessionId);
       await this.updateSessionStatus(sessionId, SessionStatus.Paused);
     }
   }

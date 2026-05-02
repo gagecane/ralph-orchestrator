@@ -2,9 +2,10 @@
  * PlanningService tests
  *
  * Covers session lifecycle (create, list, get, delete, resume, stop), response
- * submission, artifact access with path-traversal protection, and status
- * mapping. Tests avoid spawning a real `ralph` binary by pointing `ralphPath`
- * at `/bin/true`, which exits immediately.
+ * submission, artifact access with path-traversal protection, status
+ * mapping, and request timeout behavior. Tests avoid spawning a real `ralph`
+ * binary by pointing `ralphPath` at `/bin/true` (immediate success) or
+ * `/bin/sleep` (forces the timeout watchdog to fire).
  */
 
 import { describe, it, before, after, beforeEach } from "node:test";
@@ -407,6 +408,113 @@ describe("PlanningService", () => {
         () => service.resumeSession("never"),
         /Session never not found/,
       );
+    });
+  });
+
+  describe("defaultTimeoutSeconds (request timeout)", () => {
+    /**
+     * Wait until a metadata file reports the expected status, or fail the
+     * test if the deadline passes. This avoids coupling tests to specific
+     * sleep durations — we just poll until the watchdog + exit handler
+     * have observably flipped the file on disk.
+     */
+    async function waitForStatus(
+      sessionDir: string,
+      want: SessionStatus,
+      timeoutMs: number,
+    ): Promise<SessionMetadata> {
+      const metadataPath = path.join(sessionDir, "session.json");
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        try {
+          const raw = await fs.readFile(metadataPath, "utf-8");
+          const meta: SessionMetadata = JSON.parse(raw);
+          if (meta.status === want) {
+            return meta;
+          }
+        } catch {
+          // metadata might be mid-write; retry
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const raw = await fs.readFile(metadataPath, "utf-8");
+      const meta: SessionMetadata = JSON.parse(raw);
+      throw new Error(
+        `Timed out waiting for status=${want}; last seen status=${meta.status}`,
+      );
+    }
+
+    it("kills a ralph process that exceeds defaultTimeoutSeconds and records timed_out", async () => {
+      // The spawn args are baked into spawnRalphForSession (`run -c ...`), so
+      // /bin/sleep would reject them and exit with code 1 before the
+      // watchdog ever fires. Drop a tiny shell script that ignores its
+      // arguments and sleeps long enough for the 100ms watchdog to trip.
+      const sleeperPath = path.join(workspaceRoot, "slow-ralph.sh");
+      await fs.writeFile(
+        sleeperPath,
+        "#!/bin/sh\nexec sleep 10\n",
+        { mode: 0o755 },
+      );
+
+      const slowService = new PlanningService({
+        workspaceRoot,
+        ralphPath: sleeperPath,
+        defaultTimeoutSeconds: 0.1,
+      });
+
+      const { sessionId } = await slowService.startSession("hang please");
+      const sessionDir = slowService.getSessionDir(sessionId);
+
+      // Wait for the watchdog → SIGTERM → exit → status write chain.
+      // 2s is plenty on any non-pathologically-slow machine.
+      const meta = await waitForStatus(sessionDir, SessionStatus.TimedOut, 2000);
+      assert.equal(meta.status, SessionStatus.TimedOut);
+    });
+
+    it("exposes timed_out backend status as 'failed' to the frontend", async () => {
+      await seedSession(workspaceRoot, "timed", {
+        status: SessionStatus.TimedOut,
+      });
+      const [summary] = await service.listSessions();
+      assert.equal(summary.status, "failed");
+
+      const detail = await service.getSession("timed");
+      assert.equal(detail.status, "failed");
+      // `completedAt` is only populated for Completed sessions, not timeouts.
+      assert.equal(detail.completedAt, undefined);
+    });
+
+    it("does not record timed_out when ralph exits on its own before the timeout", async () => {
+      // /bin/true exits ~immediately; the 5s watchdog will never fire. We
+      // want the session to end up as `completed`, not `timed_out`.
+      const fastService = new PlanningService({
+        workspaceRoot,
+        ralphPath: "/bin/true",
+        defaultTimeoutSeconds: 5,
+      });
+
+      const { sessionId } = await fastService.startSession("fast");
+      const sessionDir = fastService.getSessionDir(sessionId);
+
+      const meta = await waitForStatus(sessionDir, SessionStatus.Completed, 2000);
+      assert.equal(meta.status, SessionStatus.Completed);
+    });
+
+    it("disables the watchdog when defaultTimeoutSeconds <= 0", async () => {
+      // A non-positive timeout means "no watchdog". /bin/true still
+      // completes immediately, so we should see `completed` with no
+      // spurious timeout interference.
+      const noTimeoutService = new PlanningService({
+        workspaceRoot,
+        ralphPath: "/bin/true",
+        defaultTimeoutSeconds: 0,
+      });
+
+      const { sessionId } = await noTimeoutService.startSession("no watchdog");
+      const sessionDir = noTimeoutService.getSessionDir(sessionId);
+
+      const meta = await waitForStatus(sessionDir, SessionStatus.Completed, 2000);
+      assert.equal(meta.status, SessionStatus.Completed);
     });
   });
 });
