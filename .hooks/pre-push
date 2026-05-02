@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Pre-push hook: run the shared Rust CI parity gate before pushing.
-# This catches the Rust-side CI failures locally, including the checks that
-# previously drifted from GitHub Actions.
+# Pre-push hook: run the shared Rust CI parity gate before pushing,
+# but only when the push actually contains Rust-relevant changes.
+#
+# Rationale: the gate includes `cargo fmt --all -- --check`, which fails
+# for pre-existing formatting drift in crates the current push doesn't
+# touch. Scoping by changed files keeps parity with CI for real Rust PRs
+# without blocking unrelated commits (docs, shell scripts, configs).
 #
 # Skip with: git push --no-verify
 
@@ -15,5 +19,33 @@ cd "$REPO_ROOT"
 while IFS= read -r git_env_var; do
   unset "$git_env_var"
 done < <(git rev-parse --local-env-vars)
+
+# git feeds one line per pushed ref on stdin:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+#
+# Run the gate if *any* pushed ref contains Rust-relevant changes.
+# Fall through to the gate if stdin is empty (defensive: caller may invoke
+# the hook script directly without stdin — better to run the gate than skip).
+need_gate=0
+saw_ref=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  saw_ref=1
+  if [[ -z "${local_sha:-}" ]]; then
+    continue
+  fi
+  if ./scripts/detect-rust-changes.sh pushed "$local_sha" "$remote_sha"; then
+    need_gate=1
+    break
+  fi
+done
+
+if [[ "$saw_ref" -eq 0 ]]; then
+  need_gate=1
+fi
+
+if [[ "$need_gate" -eq 0 ]]; then
+  echo "pre-push: no Rust-relevant files in this push; skipping cargo fmt/clippy/test."
+  exit 0
+fi
 
 ./scripts/ci-rust-gate.sh

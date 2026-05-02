@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Pre-commit hook: run the fast subset of the shared Rust CI parity gate.
-# This keeps commit-time checks aligned with CI without running the slower
-# hooks BDD and mock E2E steps on every commit.
+# Pre-commit hook: run the fast subset of the shared Rust CI parity gate,
+# but only when the commit actually contains Rust-relevant changes.
+#
+# See .hooks/pre-push for the scoping rationale.
+#
+# Skip with: git commit --no-verify
 
 set -euo pipefail
 
@@ -13,5 +16,10 @@ cd "$REPO_ROOT"
 while IFS= read -r git_env_var; do
   unset "$git_env_var"
 done < <(git rev-parse --local-env-vars)
+
+if ! ./scripts/detect-rust-changes.sh staged; then
+  echo "pre-commit: no Rust-relevant files staged; skipping cargo fmt/clippy/test."
+  exit 0
+fi
 
 ./scripts/ci-rust-gate.sh --skip-hooks-bdd --skip-mock-e2e
