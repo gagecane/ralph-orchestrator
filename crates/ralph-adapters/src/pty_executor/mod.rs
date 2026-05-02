@@ -14,179 +14,51 @@
 //! - Uses `tokio::select!` for non-blocking I/O multiplexing
 //! - Spawns separate tasks for PTY output and user input
 //! - Enables responsive Ctrl+C handling even when PTY is idle
+//!
+//! ## Module layout
+//!
+//! The [`PtyExecutor`] implementation in this file wires together helpers
+//! from the following submodules:
+//!
+//! - [`config`] — configuration and result types ([`PtyConfig`], [`PtyExecutionResult`], [`TerminationType`])
+//! - [`ctrl_c`] — double-Ctrl+C state machine ([`CtrlCState`], [`CtrlCAction`])
+//! - [`io_events`] — PTY I/O event enums and ANSI stripping helpers
+//! - [`spawn`] — Ralph runtime environment injection for spawned children
+//! - [`parser`] — Claude / Copilot / Pi stream dispatch and result building
+//! - [`cleanup`] — Child termination and interruptible exit waiting
 
 // Exit codes and PIDs are always within i32 range in practice
 #![allow(clippy::cast_possible_wrap)]
 
-use crate::claude_stream::{ClaudeStreamEvent, ClaudeStreamParser, ContentBlock, UserContentBlock};
+mod cleanup;
+mod config;
+mod ctrl_c;
+mod io_events;
+mod parser;
+mod spawn;
+#[cfg(test)]
+mod test_support;
+
+pub use config::{PtyConfig, PtyExecutionResult, TerminationType};
+pub use ctrl_c::{CtrlCAction, CtrlCState};
+
+use crate::claude_stream::{ClaudeStreamEvent, ClaudeStreamParser};
 use crate::cli_backend::{CliBackend, OutputFormat};
-use crate::copilot_stream::{
-    CopilotStreamParser, CopilotStreamState, dispatch_copilot_stream_event,
-};
+use crate::copilot_stream::CopilotStreamState;
 use crate::pi_stream::{PiSessionState, PiStreamParser, dispatch_pi_stream_event};
 use crate::stream_handler::{SessionResult, StreamHandler};
-#[cfg(unix)]
-use nix::sys::signal::{Signal, kill};
-#[cfg(unix)]
-use nix::unistd::Pid;
+use io_events::{InputEvent, OutputEvent};
+use parser::{
+    build_result, dispatch_stream_event, extract_cli_flag_value, handle_copilot_stream_line,
+    resolve_termination_type,
+};
 use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
-use std::env;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
-
-/// Result of a PTY execution.
-#[derive(Debug)]
-pub struct PtyExecutionResult {
-    /// The accumulated output (ANSI sequences preserved).
-    pub output: String,
-    /// The ANSI-stripped output for event parsing.
-    pub stripped_output: String,
-    /// Extracted text content from NDJSON stream (for Claude's stream-json output).
-    /// When Claude outputs `--output-format stream-json`, event tags like
-    /// `<event topic="...">` are inside JSON string values. This field contains
-    /// the extracted text content for proper event parsing.
-    /// Empty for non-JSON backends (use `stripped_output` instead).
-    pub extracted_text: String,
-    /// Whether the process exited successfully.
-    pub success: bool,
-    /// The exit code if available.
-    pub exit_code: Option<i32>,
-    /// How the process was terminated.
-    pub termination: TerminationType,
-    /// Total session cost in USD, if available from stream metadata.
-    pub total_cost_usd: f64,
-    /// Total input tokens in the session.
-    pub input_tokens: u64,
-    /// Total output tokens in the session.
-    pub output_tokens: u64,
-    /// Total cache-read tokens in the session.
-    pub cache_read_tokens: u64,
-    /// Total cache-write tokens in the session.
-    pub cache_write_tokens: u64,
-}
-
-/// How the PTY process was terminated.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminationType {
-    /// Process exited naturally.
-    Natural,
-    /// Terminated due to idle timeout.
-    IdleTimeout,
-    /// Terminated by user (double Ctrl+C).
-    UserInterrupt,
-    /// Force killed by user (Ctrl+\).
-    ForceKill,
-}
-
-/// Configuration for PTY execution.
-#[derive(Debug, Clone)]
-pub struct PtyConfig {
-    /// Enable interactive mode (forward user input).
-    pub interactive: bool,
-    /// Idle timeout in seconds (0 = disabled).
-    pub idle_timeout_secs: u32,
-    /// Terminal width.
-    pub cols: u16,
-    /// Terminal height.
-    pub rows: u16,
-    /// Workspace root directory for command execution.
-    /// This is captured at startup to avoid `current_dir()` failures when the
-    /// working directory no longer exists (e.g., in E2E test workspaces).
-    pub workspace_root: std::path::PathBuf,
-}
-
-impl Default for PtyConfig {
-    fn default() -> Self {
-        Self {
-            interactive: true,
-            idle_timeout_secs: 30,
-            cols: 80,
-            rows: 24,
-            workspace_root: std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        }
-    }
-}
-
-impl PtyConfig {
-    /// Creates config from environment, falling back to defaults.
-    pub fn from_env() -> Self {
-        let cols = std::env::var("COLUMNS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(80);
-        let rows = std::env::var("LINES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24);
-
-        Self {
-            cols,
-            rows,
-            ..Default::default()
-        }
-    }
-
-    /// Sets the workspace root directory.
-    pub fn with_workspace_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
-        self.workspace_root = root.into();
-        self
-    }
-}
-
-/// State machine for double Ctrl+C detection.
-#[derive(Debug)]
-pub struct CtrlCState {
-    /// When the first Ctrl+C was pressed (if any).
-    first_press: Option<Instant>,
-    /// Window duration for double-press detection.
-    window: Duration,
-}
-
-/// Action to take after handling Ctrl+C.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CtrlCAction {
-    /// Forward the Ctrl+C to Claude and start/restart the window.
-    ForwardAndStartWindow,
-    /// Terminate Claude (second Ctrl+C within window).
-    Terminate,
-}
-
-impl CtrlCState {
-    /// Creates a new Ctrl+C state tracker.
-    pub fn new() -> Self {
-        Self {
-            first_press: None,
-            window: Duration::from_secs(1),
-        }
-    }
-
-    /// Handles a Ctrl+C keypress and returns the action to take.
-    pub fn handle_ctrl_c(&mut self, now: Instant) -> CtrlCAction {
-        match self.first_press {
-            Some(first) if now.duration_since(first) < self.window => {
-                // Second Ctrl+C within window - terminate
-                self.first_press = None;
-                CtrlCAction::Terminate
-            }
-            _ => {
-                // First Ctrl+C or window expired - forward and start window
-                self.first_press = Some(now);
-                CtrlCAction::ForwardAndStartWindow
-            }
-        }
-    }
-}
-
-impl Default for CtrlCState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Executor for running prompts in a pseudo-terminal.
 pub struct PtyExecutor {
@@ -316,7 +188,7 @@ impl PtyExecutor {
 
         // Set up environment for PTY
         cmd_builder.env("TERM", "xterm-256color");
-        inject_ralph_runtime_env(&mut cmd_builder, &self.config.workspace_root);
+        spawn::inject_ralph_runtime_env(&mut cmd_builder, &self.config.workspace_root);
 
         // Apply backend-specific environment variables (e.g., Agent Teams env var)
         for (key, value) in &self.backend.env_vars {
@@ -462,7 +334,7 @@ impl PtyExecutor {
                         debug!("Interrupt received in observe mode, terminating");
                         termination = TerminationType::UserInterrupt;
                         should_terminate.store(true, Ordering::SeqCst);
-                        let _ = self.terminate_child(&mut child, true).await;
+                        let _ = cleanup::terminate_child(&mut child, true).await;
                         break;
                     }
                 }
@@ -505,7 +377,7 @@ impl PtyExecutor {
                     );
                     termination = TerminationType::IdleTimeout;
                     should_terminate.store(true, Ordering::SeqCst);
-                    self.terminate_child(&mut child, true).await?;
+                    cleanup::terminate_child(&mut child, true).await?;
                     break;
                 }
             }
@@ -571,9 +443,9 @@ impl PtyExecutor {
         should_terminate.store(true, Ordering::SeqCst);
 
         // Wait for child to fully exit (interruptible + bounded)
-        let status = self
-            .wait_for_exit(&mut child, Some(Duration::from_secs(2)), &mut interrupt_rx)
-            .await?;
+        let status =
+            cleanup::wait_for_exit(&mut child, Some(Duration::from_secs(2)), &mut interrupt_rx)
+                .await?;
 
         let (success, exit_code, final_termination) = match status {
             Some(s) => {
@@ -757,7 +629,7 @@ impl PtyExecutor {
                         debug!("Interrupt received in streaming observe mode, terminating");
                         termination = TerminationType::UserInterrupt;
                         should_terminate.store(true, Ordering::SeqCst);
-                        let _ = self.terminate_child(&mut child, true).await;
+                        let _ = cleanup::terminate_child(&mut child, true).await;
                         break;
                     }
                 }
@@ -903,7 +775,7 @@ impl PtyExecutor {
                     );
                     termination = TerminationType::IdleTimeout;
                     should_terminate.store(true, Ordering::SeqCst);
-                    self.terminate_child(&mut child, true).await?;
+                    cleanup::terminate_child(&mut child, true).await?;
                     break;
                 }
             }
@@ -1151,9 +1023,9 @@ impl PtyExecutor {
 
         should_terminate.store(true, Ordering::SeqCst);
 
-        let status = self
-            .wait_for_exit(&mut child, Some(Duration::from_secs(2)), &mut interrupt_rx)
-            .await?;
+        let status =
+            cleanup::wait_for_exit(&mut child, Some(Duration::from_secs(2)), &mut interrupt_rx)
+                .await?;
 
         let (success, exit_code, final_termination) = match status {
             Some(s) => {
@@ -1504,7 +1376,7 @@ impl PtyExecutor {
                                     info!("Double Ctrl+C detected, terminating");
                                     termination = TerminationType::UserInterrupt;
                                     should_terminate.store(true, Ordering::SeqCst);
-                                    self.terminate_child(&mut child, true).await?;
+                                    cleanup::terminate_child(&mut child, true).await?;
                                     break;
                                 }
                             }
@@ -1513,7 +1385,7 @@ impl PtyExecutor {
                             info!("Ctrl+\\ detected, force killing");
                             termination = TerminationType::ForceKill;
                             should_terminate.store(true, Ordering::SeqCst);
-                            self.terminate_child(&mut child, false).await?;
+                            cleanup::terminate_child(&mut child, false).await?;
                             break;
                         }
                         Some(InputEvent::Data(data)) => {
@@ -1544,7 +1416,7 @@ impl PtyExecutor {
                                         info!("Double Ctrl+C detected, terminating");
                                         termination = TerminationType::UserInterrupt;
                                         should_terminate.store(true, Ordering::SeqCst);
-                                        self.terminate_child(&mut child, true).await?;
+                                        cleanup::terminate_child(&mut child, true).await?;
                                         break;
                                     }
                                 }
@@ -1553,7 +1425,7 @@ impl PtyExecutor {
                                 info!("Ctrl+\\ detected, force killing");
                                 termination = TerminationType::ForceKill;
                                 should_terminate.store(true, Ordering::SeqCst);
-                                self.terminate_child(&mut child, false).await?;
+                                cleanup::terminate_child(&mut child, false).await?;
                                 break;
                             }
                             InputEvent::Data(bytes) => {
@@ -1574,7 +1446,7 @@ impl PtyExecutor {
                                 info!("Control command: Kill");
                                 termination = TerminationType::UserInterrupt;
                                 should_terminate.store(true, Ordering::SeqCst);
-                                self.terminate_child(&mut child, true).await?;
+                                cleanup::terminate_child(&mut child, true).await?;
                                 break;
                             }
                             ControlCommand::Resize(cols, rows) => {
@@ -1605,7 +1477,7 @@ impl PtyExecutor {
                     );
                     termination = TerminationType::IdleTimeout;
                     should_terminate.store(true, Ordering::SeqCst);
-                    self.terminate_child(&mut child, true).await?;
+                    cleanup::terminate_child(&mut child, true).await?;
                     break;
                 }
 
@@ -1615,7 +1487,7 @@ impl PtyExecutor {
                         debug!("Interrupt received in interactive mode, terminating");
                         termination = TerminationType::UserInterrupt;
                         should_terminate.store(true, Ordering::SeqCst);
-                        self.terminate_child(&mut child, true).await?;
+                        cleanup::terminate_child(&mut child, true).await?;
                         break;
                     }
                 }
@@ -1629,9 +1501,9 @@ impl PtyExecutor {
         let _ = self.terminated_tx.send(true);
 
         // Wait for child to fully exit (interruptible + bounded)
-        let status = self
-            .wait_for_exit(&mut child, Some(Duration::from_secs(2)), &mut interrupt_rx)
-            .await?;
+        let status =
+            cleanup::wait_for_exit(&mut child, Some(Duration::from_secs(2)), &mut interrupt_rx)
+                .await?;
 
         let (success, exit_code, final_termination) = match status {
             Some(s) => {
@@ -1658,480 +1530,16 @@ impl PtyExecutor {
             None,
         ))
     }
-
-    /// Terminates the child process.
-    ///
-    /// If `graceful` is true, sends SIGTERM and waits up to 5 seconds before SIGKILL.
-    /// If `graceful` is false, sends SIGKILL immediately.
-    ///
-    /// This is an async function to avoid blocking the tokio runtime during the
-    /// grace period wait. Previously used `std::thread::sleep` which blocked the
-    /// worker thread for up to 5 seconds, making the TUI appear frozen.
-    #[allow(clippy::unused_self)] // Self is conceptually the right receiver for this method
-    #[allow(clippy::unused_async)] // Kept async to preserve signature parity with Unix implementation
-    #[cfg(not(unix))]
-    async fn terminate_child(
-        &self,
-        child: &mut Box<dyn portable_pty::Child + Send>,
-        _graceful: bool,
-    ) -> io::Result<()> {
-        child.kill()
-    }
-
-    #[cfg(unix)]
-    async fn terminate_child(
-        &self,
-        child: &mut Box<dyn portable_pty::Child + Send>,
-        graceful: bool,
-    ) -> io::Result<()> {
-        let pid = match child.process_id() {
-            Some(id) => Pid::from_raw(id as i32),
-            None => return Ok(()), // Already exited
-        };
-
-        if graceful {
-            debug!(pid = %pid, "Sending SIGTERM");
-            let _ = kill(pid, Signal::SIGTERM);
-
-            // Wait up to 5 seconds for graceful exit (reduced from 5s for better UX)
-            let grace_period = Duration::from_secs(2);
-            let start = Instant::now();
-
-            while start.elapsed() < grace_period {
-                if child
-                    .try_wait()
-                    .map_err(|e| io::Error::other(e.to_string()))?
-                    .is_some()
-                {
-                    return Ok(());
-                }
-                // Use async sleep to avoid blocking the tokio runtime
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-
-            // Still running after grace period - force kill
-            debug!(pid = %pid, "Grace period expired, sending SIGKILL");
-        }
-
-        debug!(pid = %pid, "Sending SIGKILL");
-        let _ = kill(pid, Signal::SIGKILL);
-        Ok(())
-    }
-
-    /// Waits for the child process to exit, optionally with a timeout.
-    ///
-    /// This is interruptible by the shared interrupt channel from the event loop.
-    /// When interrupted, returns `Ok(None)` to let the caller handle termination.
-    async fn wait_for_exit(
-        &self,
-        child: &mut Box<dyn portable_pty::Child + Send>,
-        max_wait: Option<Duration>,
-        interrupt_rx: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> io::Result<Option<portable_pty::ExitStatus>> {
-        let start = Instant::now();
-
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|e| io::Error::other(e.to_string()))?
-            {
-                return Ok(Some(status));
-            }
-
-            if let Some(max) = max_wait
-                && start.elapsed() >= max
-            {
-                return Ok(None);
-            }
-
-            tokio::select! {
-                _ = interrupt_rx.changed() => {
-                    if *interrupt_rx.borrow() {
-                        debug!("Interrupt received while waiting for child exit");
-                        return Ok(None);
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
-    }
-}
-
-fn handle_copilot_stream_line<H: StreamHandler>(
-    line: &str,
-    handler: &mut H,
-    extracted_text: &mut String,
-    copilot_state: &mut CopilotStreamState,
-) -> Option<SessionResult> {
-    let event = CopilotStreamParser::parse_line(line)?;
-    dispatch_copilot_stream_event(event, handler, extracted_text, copilot_state)
-}
-
-fn inject_ralph_runtime_env(cmd_builder: &mut CommandBuilder, workspace_root: &std::path::Path) {
-    let Ok(current_exe) = env::current_exe() else {
-        return;
-    };
-    let Some(bin_dir) = current_exe.parent() else {
-        return;
-    };
-
-    let mut path_entries = vec![bin_dir.to_path_buf()];
-    if let Some(existing_path) = env::var_os("PATH") {
-        path_entries.extend(env::split_paths(&existing_path));
-    }
-
-    if let Ok(joined_path) = env::join_paths(path_entries) {
-        cmd_builder.env("PATH", joined_path);
-    }
-    cmd_builder.env("RALPH_BIN", current_exe);
-    cmd_builder.env("RALPH_WORKSPACE_ROOT", workspace_root);
-
-    // Propagate RALPH_EVENTS_FILE so `ralph emit` from any CWD writes to the correct events file
-    let marker = workspace_root.join(".ralph/current-events");
-    if let Ok(relative) = std::fs::read_to_string(&marker) {
-        let abs = workspace_root.join(relative.trim());
-        cmd_builder.env("RALPH_EVENTS_FILE", abs);
-    }
-
-    if std::path::Path::new("/var/tmp").is_dir() {
-        cmd_builder.env("TMPDIR", "/var/tmp");
-        cmd_builder.env("TMP", "/var/tmp");
-        cmd_builder.env("TEMP", "/var/tmp");
-    }
-}
-
-/// Input events from the user.
-#[derive(Debug)]
-enum InputEvent {
-    /// Ctrl+C pressed.
-    CtrlC,
-    /// Ctrl+\ pressed.
-    CtrlBackslash,
-    /// Regular data to forward.
-    Data(Vec<u8>),
-}
-
-impl InputEvent {
-    /// Creates an InputEvent from raw bytes.
-    fn from_bytes(data: Vec<u8>) -> Self {
-        if data.len() == 1 {
-            match data[0] {
-                3 => return InputEvent::CtrlC,
-                28 => return InputEvent::CtrlBackslash,
-                _ => {}
-            }
-        }
-        InputEvent::Data(data)
-    }
-}
-
-/// Output events from the PTY.
-#[derive(Debug)]
-enum OutputEvent {
-    /// Data received from PTY.
-    Data(Vec<u8>),
-    /// PTY reached EOF (process exited).
-    Eof,
-    /// Error reading from PTY.
-    Error(String),
-}
-
-/// Strips ANSI escape sequences from raw bytes.
-///
-/// Uses `strip-ansi-escapes` for direct byte-level ANSI removal without terminal
-/// emulation. This ensures ALL content is preserved regardless of output size,
-/// unlike vt100's terminal simulation which can lose content that scrolls off.
-fn strip_ansi(bytes: &[u8]) -> String {
-    let stripped = strip_ansi_escapes::strip(bytes);
-    String::from_utf8_lossy(&stripped).into_owned()
-}
-
-/// Determines the final termination type, accounting for SIGINT exit code.
-///
-/// Exit code 130 indicates the process was killed by SIGINT (Ctrl+C forwarded to PTY).
-fn resolve_termination_type(exit_code: i32, default: TerminationType) -> TerminationType {
-    if exit_code == 130 {
-        info!("Child process killed by SIGINT");
-        TerminationType::UserInterrupt
-    } else {
-        default
-    }
-}
-
-fn extract_cli_flag_value(args: &[String], long_flag: &str, short_flag: &str) -> Option<String> {
-    for (i, arg) in args.iter().enumerate() {
-        if arg == long_flag || arg == short_flag {
-            if let Some(value) = args.get(i + 1)
-                && !value.starts_with('-')
-            {
-                return Some(value.clone());
-            }
-            continue;
-        }
-
-        if let Some(value) = arg.strip_prefix(&format!("{long_flag}="))
-            && !value.is_empty()
-        {
-            return Some(value.to_string());
-        }
-
-        if let Some(value) = arg.strip_prefix(&format!("{short_flag}="))
-            && !value.is_empty()
-        {
-            return Some(value.to_string());
-        }
-    }
-
-    None
-}
-
-/// Dispatches a Claude stream event to the appropriate handler method.
-/// Also accumulates text content into `extracted_text` for event parsing.
-fn dispatch_stream_event<H: StreamHandler>(
-    event: ClaudeStreamEvent,
-    handler: &mut H,
-    extracted_text: &mut String,
-) {
-    match event {
-        ClaudeStreamEvent::System { .. } => {
-            // Session initialization - could log in verbose mode but not user-facing
-        }
-        ClaudeStreamEvent::Assistant { message, .. } => {
-            for block in message.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        handler.on_text(&text);
-                        // Accumulate text for event parsing
-                        extracted_text.push_str(&text);
-                        extracted_text.push('\n');
-                    }
-                    ContentBlock::ToolUse { name, id, input } => {
-                        handler.on_tool_call(&name, &id, &input)
-                    }
-                }
-            }
-        }
-        ClaudeStreamEvent::User { message } => {
-            for block in message.content {
-                match block {
-                    UserContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                    } => {
-                        handler.on_tool_result(&tool_use_id, &content);
-                    }
-                }
-            }
-        }
-        ClaudeStreamEvent::Result {
-            duration_ms,
-            total_cost_usd,
-            num_turns,
-            is_error,
-        } => {
-            if is_error {
-                handler.on_error("Session ended with error");
-            }
-            handler.on_complete(&SessionResult {
-                duration_ms,
-                total_cost_usd,
-                num_turns,
-                is_error,
-                ..Default::default()
-            });
-        }
-    }
-}
-
-/// Builds a `PtyExecutionResult` from the accumulated output and exit status.
-///
-/// # Arguments
-/// * `output` - Raw bytes from PTY
-/// * `success` - Whether process exited successfully
-/// * `exit_code` - Process exit code if available
-/// * `termination` - How the process was terminated
-/// * `extracted_text` - Text extracted from NDJSON stream (for Claude's stream-json)
-fn build_result(
-    output: &[u8],
-    success: bool,
-    exit_code: Option<i32>,
-    termination: TerminationType,
-    extracted_text: String,
-    session_result: Option<&SessionResult>,
-) -> PtyExecutionResult {
-    let (total_cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
-        if let Some(result) = session_result {
-            (
-                result.total_cost_usd,
-                result.input_tokens,
-                result.output_tokens,
-                result.cache_read_tokens,
-                result.cache_write_tokens,
-            )
-        } else {
-            (0.0, 0, 0, 0, 0)
-        };
-
-    PtyExecutionResult {
-        output: String::from_utf8_lossy(output).to_string(),
-        stripped_output: strip_ansi(output),
-        extracted_text,
-        success,
-        exit_code,
-        termination,
-        total_cost_usd,
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::CapturingHandler;
     use super::*;
-    use crate::claude_stream::{AssistantMessage, UserMessage};
     #[cfg(unix)]
     use crate::cli_backend::PromptMode;
-    use crate::stream_handler::{SessionResult, StreamHandler};
     #[cfg(unix)]
     use tempfile::TempDir;
-
-    #[test]
-    fn test_double_ctrl_c_within_window() {
-        let mut state = CtrlCState::new();
-        let now = Instant::now();
-
-        // First Ctrl+C: should forward and start window
-        let action = state.handle_ctrl_c(now);
-        assert_eq!(action, CtrlCAction::ForwardAndStartWindow);
-
-        // Second Ctrl+C within 1 second: should terminate
-        let later = now + Duration::from_millis(500);
-        let action = state.handle_ctrl_c(later);
-        assert_eq!(action, CtrlCAction::Terminate);
-    }
-
-    #[test]
-    fn test_input_event_from_bytes_ctrl_c() {
-        let event = InputEvent::from_bytes(vec![3]);
-        assert!(matches!(event, InputEvent::CtrlC));
-    }
-
-    #[test]
-    fn test_input_event_from_bytes_ctrl_backslash() {
-        let event = InputEvent::from_bytes(vec![28]);
-        assert!(matches!(event, InputEvent::CtrlBackslash));
-    }
-
-    #[test]
-    fn test_input_event_from_bytes_data() {
-        let event = InputEvent::from_bytes(vec![b'a']);
-        assert!(matches!(event, InputEvent::Data(_)));
-
-        let event = InputEvent::from_bytes(vec![1, 2, 3]);
-        assert!(matches!(event, InputEvent::Data(_)));
-    }
-
-    #[test]
-    fn test_ctrl_c_window_expires() {
-        let mut state = CtrlCState::new();
-        let now = Instant::now();
-
-        // First Ctrl+C
-        state.handle_ctrl_c(now);
-
-        // Wait 2 seconds (window expires)
-        let later = now + Duration::from_secs(2);
-
-        // Second Ctrl+C: window expired, should forward and start new window
-        let action = state.handle_ctrl_c(later);
-        assert_eq!(action, CtrlCAction::ForwardAndStartWindow);
-    }
-
-    #[test]
-    fn test_strip_ansi_basic() {
-        let input = b"\x1b[1;36m  Thinking...\x1b[0m\r\n";
-        let stripped = strip_ansi(input);
-        assert!(stripped.contains("Thinking..."));
-        assert!(!stripped.contains("\x1b["));
-    }
-
-    #[test]
-    fn test_completion_promise_extraction() {
-        // Simulate Claude output with heavy ANSI formatting
-        let input = b"\x1b[1;36m  Thinking...\x1b[0m\r\n\
-                      \x1b[2K\x1b[1;32m  Done!\x1b[0m\r\n\
-                      \x1b[33mLOOP_COMPLETE\x1b[0m\r\n";
-
-        let stripped = strip_ansi(input);
-
-        // Event parser sees clean text
-        assert!(stripped.contains("LOOP_COMPLETE"));
-        assert!(!stripped.contains("\x1b["));
-    }
-
-    #[test]
-    fn test_event_tag_extraction() {
-        // Event tags may be wrapped in ANSI codes
-        let input = b"\x1b[90m<event topic=\"build.done\">\x1b[0m\r\n\
-                      Task completed successfully\r\n\
-                      \x1b[90m</event>\x1b[0m\r\n";
-
-        let stripped = strip_ansi(input);
-
-        assert!(stripped.contains("<event topic=\"build.done\">"));
-        assert!(stripped.contains("</event>"));
-    }
-
-    #[test]
-    fn test_large_output_preserves_early_events() {
-        // Regression test: ensure event tags aren't lost when output is large
-        let mut input = Vec::new();
-
-        // Event tag at the beginning
-        input.extend_from_slice(b"<event topic=\"build.task\">Implement feature X</event>\r\n");
-
-        // Simulate 500 lines of verbose output (would overflow any terminal)
-        for i in 0..500 {
-            input.extend_from_slice(format!("Line {}: Processing step {}...\r\n", i, i).as_bytes());
-        }
-
-        let stripped = strip_ansi(&input);
-
-        // Event tag should still be present - no scrollback loss with strip-ansi-escapes
-        assert!(
-            stripped.contains("<event topic=\"build.task\">"),
-            "Event tag was lost - strip_ansi is not preserving all content"
-        );
-        assert!(stripped.contains("Implement feature X"));
-        assert!(stripped.contains("Line 499")); // Last line should be present too
-    }
-
-    #[test]
-    fn test_pty_config_defaults() {
-        let config = PtyConfig::default();
-        assert!(config.interactive);
-        assert_eq!(config.idle_timeout_secs, 30);
-        assert_eq!(config.cols, 80);
-        assert_eq!(config.rows, 24);
-    }
-
-    #[test]
-    fn test_pty_config_from_env_matches_env_or_defaults() {
-        let cols = std::env::var("COLUMNS")
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(80);
-        let rows = std::env::var("LINES")
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(24);
-
-        let config = PtyConfig::from_env();
-        assert_eq!(config.cols, cols);
-        assert_eq!(config.rows, rows);
-    }
 
     /// Verifies that the idle timeout logic in run_interactive correctly handles
     /// activity resets. Per spec (interactive-mode.spec.md lines 155-159):
@@ -2163,192 +1571,6 @@ mod tests {
         let new_remaining = timeout_duration.saturating_sub(elapsed);
         assert!(new_remaining > Duration::from_secs(29)); // Should be nearly full timeout
     }
-
-    #[test]
-    fn test_extracted_text_field_exists() {
-        // Test that PtyExecutionResult has extracted_text field
-        // This is for NDJSON output where event tags are inside JSON strings
-        let result = PtyExecutionResult {
-            output: String::new(),
-            stripped_output: String::new(),
-            extracted_text: String::from("<event topic=\"build.done\">Test</event>"),
-            success: true,
-            exit_code: Some(0),
-            termination: TerminationType::Natural,
-            total_cost_usd: 0.0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        };
-
-        assert!(
-            result
-                .extracted_text
-                .contains("<event topic=\"build.done\">")
-        );
-    }
-
-    #[test]
-    fn test_build_result_includes_extracted_text() {
-        // Test that build_result properly handles extracted_text
-        let output = b"raw output";
-        let extracted = "extracted text with <event topic=\"test\">payload</event>";
-        let result = build_result(
-            output,
-            true,
-            Some(0),
-            TerminationType::Natural,
-            extracted.to_string(),
-            None,
-        );
-
-        assert_eq!(result.extracted_text, extracted);
-        assert!(result.stripped_output.contains("raw output"));
-    }
-
-    #[test]
-    fn test_resolve_termination_type_handles_sigint_exit_code() {
-        let termination = resolve_termination_type(130, TerminationType::Natural);
-        assert_eq!(termination, TerminationType::UserInterrupt);
-
-        let termination = resolve_termination_type(0, TerminationType::ForceKill);
-        assert_eq!(termination, TerminationType::ForceKill);
-    }
-
-    #[test]
-    fn test_extract_cli_flag_value_supports_split_and_equals_syntax() {
-        let args = vec![
-            "--provider".to_string(),
-            "anthropic".to_string(),
-            "--model=claude-sonnet-4".to_string(),
-        ];
-
-        assert_eq!(
-            extract_cli_flag_value(&args, "--provider", "-p"),
-            Some("anthropic".to_string())
-        );
-        assert_eq!(
-            extract_cli_flag_value(&args, "--model", "-m"),
-            Some("claude-sonnet-4".to_string())
-        );
-        assert_eq!(extract_cli_flag_value(&args, "--foo", "-f"), None);
-    }
-
-    #[derive(Default)]
-    struct CapturingHandler {
-        texts: Vec<String>,
-        tool_calls: Vec<(String, String, serde_json::Value)>,
-        tool_results: Vec<(String, String)>,
-        errors: Vec<String>,
-        completions: Vec<SessionResult>,
-    }
-
-    impl StreamHandler for CapturingHandler {
-        fn on_text(&mut self, text: &str) {
-            self.texts.push(text.to_string());
-        }
-
-        fn on_tool_call(&mut self, name: &str, id: &str, input: &serde_json::Value) {
-            self.tool_calls
-                .push((name.to_string(), id.to_string(), input.clone()));
-        }
-
-        fn on_tool_result(&mut self, id: &str, output: &str) {
-            self.tool_results.push((id.to_string(), output.to_string()));
-        }
-
-        fn on_error(&mut self, error: &str) {
-            self.errors.push(error.to_string());
-        }
-
-        fn on_complete(&mut self, result: &SessionResult) {
-            self.completions.push(result.clone());
-        }
-    }
-
-    #[test]
-    fn test_dispatch_stream_event_routes_text_and_tool_calls() {
-        let mut handler = CapturingHandler::default();
-        let mut extracted_text = String::new();
-
-        let event = ClaudeStreamEvent::Assistant {
-            message: AssistantMessage {
-                content: vec![
-                    ContentBlock::Text {
-                        text: "Hello".to_string(),
-                    },
-                    ContentBlock::ToolUse {
-                        id: "tool-1".to_string(),
-                        name: "Read".to_string(),
-                        input: serde_json::json!({"path": "README.md"}),
-                    },
-                ],
-            },
-            usage: None,
-        };
-
-        dispatch_stream_event(event, &mut handler, &mut extracted_text);
-
-        assert_eq!(handler.texts, vec!["Hello".to_string()]);
-        assert_eq!(handler.tool_calls.len(), 1);
-        assert!(extracted_text.contains("Hello"));
-        assert!(extracted_text.ends_with('\n'));
-    }
-
-    #[test]
-    fn test_dispatch_stream_event_routes_tool_results_and_completion() {
-        let mut handler = CapturingHandler::default();
-        let mut extracted_text = String::new();
-
-        let event = ClaudeStreamEvent::User {
-            message: UserMessage {
-                content: vec![UserContentBlock::ToolResult {
-                    tool_use_id: "tool-1".to_string(),
-                    content: "done".to_string(),
-                }],
-            },
-        };
-
-        dispatch_stream_event(event, &mut handler, &mut extracted_text);
-        assert_eq!(handler.tool_results.len(), 1);
-        assert_eq!(handler.tool_results[0].0, "tool-1");
-        assert_eq!(handler.tool_results[0].1, "done");
-
-        let event = ClaudeStreamEvent::Result {
-            duration_ms: 12,
-            total_cost_usd: 0.01,
-            num_turns: 2,
-            is_error: true,
-        };
-
-        dispatch_stream_event(event, &mut handler, &mut extracted_text);
-        assert_eq!(handler.errors.len(), 1);
-        assert_eq!(handler.completions.len(), 1);
-        assert!(handler.completions[0].is_error);
-    }
-
-    #[test]
-    fn test_dispatch_stream_event_system_noop() {
-        let mut handler = CapturingHandler::default();
-        let mut extracted_text = String::new();
-
-        let event = ClaudeStreamEvent::System {
-            session_id: "session-1".to_string(),
-            model: "claude-test".to_string(),
-            tools: Vec::new(),
-        };
-
-        dispatch_stream_event(event, &mut handler, &mut extracted_text);
-
-        assert!(handler.texts.is_empty());
-        assert!(handler.tool_calls.is_empty());
-        assert!(handler.tool_results.is_empty());
-        assert!(handler.errors.is_empty());
-        assert!(handler.completions.is_empty());
-        assert!(extracted_text.is_empty());
-    }
-
     /// Regression test: TUI mode should not spawn stdin reader thread
     ///
     /// Bug: In TUI mode, Ctrl+C required double-press to exit because the stdin
@@ -2388,7 +1610,6 @@ mod tests {
             "When tui_mode is false, stdin reader must be spawned"
         );
     }
-
     #[test]
     fn test_tui_mode_default_is_false() {
         // Create a PtyExecutor and verify tui_mode defaults to false
@@ -2399,7 +1620,6 @@ mod tests {
         // tui_mode should default to false
         assert!(!executor.tui_mode, "tui_mode should default to false");
     }
-
     #[test]
     fn test_set_tui_mode() {
         // Create a PtyExecutor and verify set_tui_mode works
@@ -2424,30 +1644,6 @@ mod tests {
             "tui_mode should be false after set_tui_mode(false)"
         );
     }
-
-    #[test]
-    fn test_build_result_populates_fields() {
-        let output = b"\x1b[31mHello\x1b[0m\n";
-        let extracted = "extracted text".to_string();
-
-        let result = build_result(
-            output,
-            true,
-            Some(0),
-            TerminationType::Natural,
-            extracted.clone(),
-            None,
-        );
-
-        assert_eq!(result.output, String::from_utf8_lossy(output));
-        assert!(result.stripped_output.contains("Hello"));
-        assert!(!result.stripped_output.contains("\x1b["));
-        assert_eq!(result.extracted_text, extracted);
-        assert!(result.success);
-        assert_eq!(result.exit_code, Some(0));
-        assert_eq!(result.termination, TerminationType::Natural);
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_observe_executes_arg_prompt() {
@@ -2481,7 +1677,6 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.termination, TerminationType::Natural);
     }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_observe_writes_stdin_prompt() {
@@ -2514,7 +1709,6 @@ mod tests {
         assert!(result.stripped_output.contains("stdin-line"));
         assert_eq!(result.termination, TerminationType::Natural);
     }
-
     /// Regression test for #280: large stdin-mode prompts deadlocked the PTY
     /// because the PTY line discipline limits canonical input to ~4KB. The fix
     /// converts stdin-mode to arg-mode in non-interactive PTY execution via
@@ -2555,7 +1749,6 @@ mod tests {
         assert!(temp_file.is_none());
         assert!(args.iter().any(|a| a == small_prompt));
     }
-
     /// Verify that PTY execution with stdin-mode backend completes without
     /// deadlock by confirming the prompt is delivered via arg mode.
     #[cfg(unix)]
@@ -2608,7 +1801,6 @@ mod tests {
             &result.output[..result.output.len().min(200)]
         );
     }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_observe_streaming_text_routes_output() {
@@ -2644,7 +1836,6 @@ mod tests {
         assert!(handler.completions.is_empty());
         assert!(result.extracted_text.is_empty());
     }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_observe_streaming_parses_stream_json() {
@@ -2685,7 +1876,6 @@ mod tests {
         assert!(result.extracted_text.contains("Hello stream"));
         assert_eq!(result.termination, TerminationType::Natural);
     }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_interactive_in_tui_mode() {
