@@ -1571,6 +1571,7 @@ fn evaluate_ac_08(
             assert_workspace_source_contains_any(
                 &[
                     "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/hooks.rs",
                     "crates/ralph-cli/src/loop_runner/tests.rs",
                 ],
                 &[
@@ -1639,6 +1640,7 @@ fn evaluate_ac_09(
             assert_workspace_source_contains_any(
                 &[
                     "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/hooks.rs",
                     "crates/ralph-cli/src/loop_runner/tests.rs",
                 ],
                 &[
@@ -1849,6 +1851,7 @@ fn evaluate_ac_13(
             assert_workspace_source_contains_any(
                 &[
                     "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/hooks.rs",
                     "crates/ralph-cli/src/loop_runner/tests.rs",
                 ],
                 &[
@@ -1906,6 +1909,7 @@ fn evaluate_ac_14(
             assert_workspace_source_contains_any(
                 &[
                     "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/hooks.rs",
                     "crates/ralph-cli/src/loop_runner/tests.rs",
                 ],
                 &[
@@ -1967,6 +1971,7 @@ fn evaluate_ac_15(
             assert_workspace_source_contains_any(
                 &[
                     "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/hooks.rs",
                     "crates/ralph-cli/src/loop_runner/tests.rs",
                 ],
                 &[
@@ -2111,6 +2116,7 @@ fn evaluate_ac_16(
             assert_workspace_source_contains_any(
                 &[
                     "crates/ralph-cli/src/loop_runner/mod.rs",
+                    "crates/ralph-cli/src/loop_runner/hooks.rs",
                     "crates/ralph-cli/src/loop_runner/tests.rs",
                 ],
                 &[
