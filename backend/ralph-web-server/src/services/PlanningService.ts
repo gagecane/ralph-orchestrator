@@ -9,6 +9,15 @@
  * - Spawns Ralph processes with planning preset
  * - Manages conversation file (JSONL format)
  * - Provides session metadata to frontend
+ *
+ * Layout:
+ * - Types live in ./planning-types
+ * - Pure conversion helpers live in ./planning-conversions
+ * - This file owns the stateful service class
+ *
+ * Types and the SessionStatus enum are re-exported below so existing
+ * `import { SessionStatus } from "./PlanningService"` style imports
+ * keep working without churn.
  */
 
 import * as fs from "node:fs/promises";
@@ -16,148 +25,44 @@ import * as path from "node:path";
 import { v4 as uuidv4 } from "uuid";
 import { spawn, ChildProcess } from "child_process";
 
-/**
- * Status of a planning session.
- */
-export enum SessionStatus {
-  Active = "active",
-  WaitingForInput = "waiting_for_input",
-  Completed = "completed",
-  TimedOut = "timed_out",
-  Failed = "failed",
-  Paused = "paused",
-}
+import {
+  type ConversationEntry,
+  type PlanningServiceOptions,
+  type PlanningSessionDetail,
+  type PlanningSessionSummary,
+  type FrontendConversationEntry,
+  type RalphEvent,
+  type SessionMetadata,
+  type UserPromptPayload,
+  SessionStatus,
+} from "./planning-types";
+import {
+  generateTitle,
+  toFrontendEntry,
+  toFrontendStatus,
+} from "./planning-conversions";
+import {
+  appendConversationEntry,
+  conversationPathFor,
+  countConversationMessages,
+  readConversationEntries,
+  readSessionMetadata,
+  sessionDirFor,
+  updateSessionStatus as writeSessionStatus,
+  writeSessionMetadata,
+} from "./planning-metadata";
 
-/**
- * Session metadata from the session.json file.
- */
-export interface SessionMetadata {
-  id: string;
-  prompt: string;
-  status: SessionStatus;
-  created_at: string;
-  updated_at: string;
-  iterations: number;
-  config?: string;
-}
-
-/**
- * A single entry in the planning conversation (backend format).
- */
-export interface ConversationEntry {
-  type: "user_prompt" | "user_response";
-  id: string;
-  text: string;
-  ts: string;
-}
-
-/**
- * Frontend-compatible conversation entry format.
- */
-export interface FrontendConversationEntry {
-  type: "prompt" | "response";
-  id: string;
-  content: string;
-  timestamp: string;
-}
-
-/**
- * Full session details with conversation history (frontend format).
- */
-export interface PlanningSessionDetail {
-  id: string;
-  prompt: string;
-  status: string;
-  title?: string;
-  createdAt: string;
-  updatedAt: string;
-  completedAt?: string;
-  conversation: FrontendConversationEntry[];
-  artifacts?: string[];
-  messageCount?: number;
-}
-
-/**
- * Summary info for session lists (frontend format).
- */
-export interface PlanningSessionSummary {
-  id: string;
-  title?: string;
-  prompt: string;
-  status: string;
-  createdAt: string;
-  updatedAt: string;
-  messageCount?: number;
-  iterations?: number;
-}
-
-/**
- * Configuration options for the PlanningService.
- */
-export interface PlanningServiceOptions {
-  /** Root directory of the Ralph project */
-  workspaceRoot: string;
-  /** Path to ralph binary (default: "ralph") */
-  ralphPath?: string;
-  /** Default timeout for user responses (seconds, default: 300) */
-  defaultTimeoutSeconds?: number;
-}
-
-/**
- * Convert backend conversation entry to frontend format.
- */
-function toFrontendEntry(entry: ConversationEntry): FrontendConversationEntry {
-  return {
-    type: entry.type === "user_prompt" ? "prompt" : "response",
-    id: entry.id,
-    content: entry.text,
-    timestamp: entry.ts,
-  };
-}
-
-/**
- * Convert backend status to frontend status string.
- */
-function toFrontendStatus(status: SessionStatus): string {
-  // Map waiting_for_input to paused for the frontend
-  if (status === SessionStatus.WaitingForInput) {
-    return "paused";
-  }
-  // The frontend has no dedicated "timed_out" state — treat it as a failure
-  // so the existing failure UI handles it without a new code path.
-  if (status === SessionStatus.TimedOut) {
-    return "failed";
-  }
-  return status;
-}
-
-/**
- * Generate a title from the prompt.
- */
-function generateTitle(prompt: string): string {
-  const trimmed = prompt.trim();
-  if (trimmed.length <= 60) {
-    return trimmed;
-  }
-  return trimmed.substring(0, 57) + "...";
-}
-
-/**
- * Represents a Ralph event from the events JSONL file.
- */
-interface RalphEvent {
-  topic: string;
-  payload: unknown;
-  ts: string;
-}
-
-/**
- * Represents the user.prompt payload format.
- */
-interface UserPromptPayload {
-  id: string;
-  question: string;
-}
+// Re-export types and enums for callers that import them from this module.
+// Keeps the public surface stable after the split.
+export {
+  SessionStatus,
+  type ConversationEntry,
+  type FrontendConversationEntry,
+  type PlanningServiceOptions,
+  type PlanningSessionDetail,
+  type PlanningSessionSummary,
+  type SessionMetadata,
+} from "./planning-types";
 
 /**
  * Service for managing planning sessions.
@@ -202,21 +107,9 @@ export class PlanningService {
 
     for (const entry of entries) {
       if (entry.isDirectory()) {
-        const metadataPath = path.join(this.sessionsDir, entry.name, "session.json");
         try {
-          const content = await fs.readFile(metadataPath, "utf-8");
-          const metadata: SessionMetadata = JSON.parse(content);
-
-          // Count messages in conversation
-          const conversationPath = path.join(this.sessionsDir, entry.name, "conversation.jsonl");
-          let messageCount = 0;
-          try {
-            const convContent = await fs.readFile(conversationPath, "utf-8");
-            messageCount = convContent.trim().split("\n").filter((l: string) => l.trim()).length;
-          } catch (err) {
-            // Expected if conversation file doesn't exist yet
-            console.warn(`[PlanningService] Could not read conversation file for session ${entry.name}:`, err);
-          }
+          const metadata = await readSessionMetadata(this.sessionsDir, entry.name);
+          const messageCount = await countConversationMessages(this.sessionsDir, entry.name);
 
           sessions.push({
             id: metadata.id,
@@ -243,31 +136,14 @@ export class PlanningService {
    * Get a specific session with full details.
    */
   async getSession(sessionId: string): Promise<PlanningSessionDetail> {
-    const sessionDir = path.join(this.sessionsDir, sessionId);
+    const sessionDir = sessionDirFor(this.sessionsDir, sessionId);
 
     // Load metadata
-    const metadataPath = path.join(sessionDir, "session.json");
-    const metadataContent = await fs.readFile(metadataPath, "utf-8");
-    const metadata: SessionMetadata = JSON.parse(metadataContent);
+    const metadata = await readSessionMetadata(this.sessionsDir, sessionId);
 
     // Load conversation
-    const conversationPath = path.join(sessionDir, "conversation.jsonl");
-    const conversation: FrontendConversationEntry[] = [];
-
-    try {
-      const conversationContent = await fs.readFile(conversationPath, "utf-8");
-      const lines = conversationContent.trim().split("\n");
-      const entries = lines
-        .filter((line: string) => line.trim().length > 0)
-        .map((line: string) => JSON.parse(line) as ConversationEntry);
-
-      // Convert to frontend format
-      for (const entry of entries) {
-        conversation.push(toFrontendEntry(entry));
-      }
-    } catch (err) {
-      console.warn(`[PlanningService:${sessionId}] Could not load conversation file:`, err);
-    }
+    const backendEntries = await readConversationEntries(this.sessionsDir, sessionId);
+    const conversation: FrontendConversationEntry[] = backendEntries.map(toFrontendEntry);
 
     // List artifacts if any
     const artifactsDir = path.join(sessionDir, "artifacts");
@@ -303,7 +179,7 @@ export class PlanningService {
 
     // Generate session ID (timestamp-based with random suffix)
     const sessionId = this.generateSessionId();
-    const sessionDir = path.join(this.sessionsDir, sessionId);
+    const sessionDir = sessionDirFor(this.sessionsDir, sessionId);
 
     // Create session directory
     await fs.mkdir(sessionDir, { recursive: true });
@@ -322,12 +198,10 @@ export class PlanningService {
       iterations: 0,
     };
 
-    const metadataPath = path.join(sessionDir, "session.json");
-    await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+    await writeSessionMetadata(this.sessionsDir, sessionId, metadata);
 
     // Create empty conversation file
-    const conversationPath = path.join(sessionDir, "conversation.jsonl");
-    await fs.writeFile(conversationPath, "");
+    await fs.writeFile(conversationPathFor(this.sessionsDir, sessionId), "");
 
     // Spawn ralph process with planning preset
     this.spawnRalphForSession(sessionId, prompt);
@@ -513,7 +387,6 @@ export class PlanningService {
             console.log(`[PlanningService:${sessionId}] Detected user.prompt from events file: id=${promptId}`);
 
             // Append the prompt to the conversation file
-            const conversationPath = path.join(this.sessionsDir, sessionId, "conversation.jsonl");
             const entry: ConversationEntry = {
               type: "user_prompt",
               id: promptId,
@@ -521,7 +394,7 @@ export class PlanningService {
               ts: event.ts,
             };
 
-            await fs.appendFile(conversationPath, JSON.stringify(entry) + "\n");
+            await appendConversationEntry(this.sessionsDir, sessionId, entry);
 
             // Update session status to waiting_for_input
             await this.updateSessionStatus(sessionId, SessionStatus.WaitingForInput);
@@ -544,16 +417,7 @@ export class PlanningService {
    * Update session status.
    */
   private async updateSessionStatus(sessionId: string, status: SessionStatus): Promise<void> {
-    const metadataPath = path.join(this.sessionsDir, sessionId, "session.json");
-    try {
-      const content = await fs.readFile(metadataPath, "utf-8");
-      const metadata: SessionMetadata = JSON.parse(content);
-      metadata.status = status;
-      metadata.updated_at = new Date().toISOString();
-      await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
-    } catch (err) {
-      console.error(`[PlanningService:${sessionId}] Failed to update status:`, err);
-    }
+    await writeSessionStatus(this.sessionsDir, sessionId, status);
   }
 
   /**
@@ -580,8 +444,6 @@ export class PlanningService {
     promptId: string,
     response: string
   ): Promise<void> {
-    const conversationPath = path.join(this.sessionsDir, sessionId, "conversation.jsonl");
-
     // Create response entry
     const entry: ConversationEntry = {
       type: "user_response",
@@ -591,23 +453,20 @@ export class PlanningService {
     };
 
     // Append to conversation file
-    await fs.appendFile(conversationPath, JSON.stringify(entry) + "\n");
+    await appendConversationEntry(this.sessionsDir, sessionId, entry);
 
     // Update session metadata (updated_at timestamp and status back to active)
-    const sessionDir = path.join(this.sessionsDir, sessionId);
-    const metadataPath = path.join(sessionDir, "session.json");
-    const metadataContent = await fs.readFile(metadataPath, "utf-8");
-    const metadata: SessionMetadata = JSON.parse(metadataContent);
+    const metadata = await readSessionMetadata(this.sessionsDir, sessionId);
     metadata.updated_at = new Date().toISOString();
     metadata.status = SessionStatus.Active;
-    await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+    await writeSessionMetadata(this.sessionsDir, sessionId, metadata);
   }
 
   /**
    * Delete a planning session.
    */
   async deleteSession(sessionId: string): Promise<void> {
-    const sessionDir = path.join(this.sessionsDir, sessionId);
+    const sessionDir = sessionDirFor(this.sessionsDir, sessionId);
 
     // Kill any running process
     const process = this.runningProcesses.get(sessionId);
@@ -626,7 +485,7 @@ export class PlanningService {
    * Resume a paused planning session.
    */
   async resumeSession(sessionId: string): Promise<void> {
-    const sessionDir = path.join(this.sessionsDir, sessionId);
+    const sessionDir = sessionDirFor(this.sessionsDir, sessionId);
 
     // Check if session exists
     try {
@@ -636,14 +495,12 @@ export class PlanningService {
     }
 
     // Load the prompt from metadata
-    const metadataPath = path.join(sessionDir, "session.json");
-    const metadataContent = await fs.readFile(metadataPath, "utf-8");
-    const metadata: SessionMetadata = JSON.parse(metadataContent);
+    const metadata = await readSessionMetadata(this.sessionsDir, sessionId);
 
     // Update status to active
     metadata.status = SessionStatus.Active;
     metadata.updated_at = new Date().toISOString();
-    await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+    await writeSessionMetadata(this.sessionsDir, sessionId, metadata);
 
     // Spawn ralph process if not already running
     if (!this.runningProcesses.has(sessionId)) {
@@ -679,14 +536,14 @@ export class PlanningService {
    * Get the conversation file path for a session.
    */
   getConversationPath(sessionId: string): string {
-    return path.join(this.sessionsDir, sessionId, "conversation.jsonl");
+    return conversationPathFor(this.sessionsDir, sessionId);
   }
 
   /**
    * Get the session directory path.
    */
   getSessionDir(sessionId: string): string {
-    return path.join(this.sessionsDir, sessionId);
+    return sessionDirFor(this.sessionsDir, sessionId);
   }
 
   /**
@@ -713,7 +570,7 @@ export class PlanningService {
     sessionId: string,
     filename: string
   ): Promise<{ content: string; filename: string }> {
-    const sessionDir = path.join(this.sessionsDir, sessionId);
+    const sessionDir = sessionDirFor(this.sessionsDir, sessionId);
     const artifactsDir = path.join(sessionDir, "artifacts");
     const artifactPath = path.join(artifactsDir, filename);
 
