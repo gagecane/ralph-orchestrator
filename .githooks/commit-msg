@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Commit-msg hook: enforce Conventional Commits on the first line.
+#
+# Pattern: <type>(<optional-scope>)!?: <description>
+#   type  = feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert
+#   scope = [a-z0-9-]+ (optional)
+#   !     = optional breaking-change marker
+#
+# Skip with: git commit --no-verify
+#
+# Reference: casc_integ/.husky/commit-msg
+
+set -euo pipefail
+
+commit_msg_file="$1"
+# Read the first non-comment, non-empty line. `git commit` appends comment
+# lines (starting with #) that must be ignored, and editors may add blank
+# lines above the subject.
+commit_msg=$(grep -v '^#' "$commit_msg_file" | sed '/^[[:space:]]*$/d' | head -1)
+
+# Allow merge, revert, fixup!, and squash! commits without Conventional Commits.
+# `git commit --amend` and `git merge` can produce subjects git expects to keep.
+case "$commit_msg" in
+  "Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*)
+    exit 0
+    ;;
+esac
+
+pattern='^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)(\([a-z0-9-]+\))?!?: .+'
+
+if ! echo "$commit_msg" | grep -qE "$pattern"; then
+  echo "ERROR: Commit message does not follow Conventional Commits format." >&2
+  echo "Expected: <type>(<optional-scope>)!?: <description>" >&2
+  echo "Types: feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert" >&2
+  echo "Example: feat(lambda): add new handler" >&2
+  echo "" >&2
+  echo "Your message: $commit_msg" >&2
+  echo "" >&2
+  echo "Skip with: git commit --no-verify" >&2
+  exit 1
+fi
