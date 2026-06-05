@@ -118,6 +118,15 @@ PROMPT.md
 !.ralph/agent/memories.md
 !.ralph/agent/tasks.jsonl
 
+# Gas Town (added by gt)
+# GT scaffolding — ephemeral state that varies per workspace/polecat.
+# .beads/ untracking handled separately (see ro-uy9o); ignore rule here
+# prevents re-add after removal.
+.beads/
+.runtime/
+state.json
+CLAUDE.local.md
+
 # Codex local state
 .codex/
 .agents/
